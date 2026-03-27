@@ -84,17 +84,270 @@ pub const NumberValue = union(enum) {
 };
 
 pub fn toNumber(val: []const u8) ?NumberValue {
-    _ = val;
-    return null;
+    if (val.len == 0) return null;
+
+    // Strip leading sign
+    var s = val;
+    var negative = false;
+    if (s[0] == '+' or s[0] == '-') {
+        negative = s[0] == '-';
+        s = s[1..];
+        if (s.len == 0) return null;
+    }
+
+    // Reject leading underscore
+    if (s[0] == '_') return null;
+
+    // Check for base prefixes
+    if (s.len >= 2 and s[0] == '0') {
+        if (s[1] == 'x' or s[1] == 'X')
+            return parseIntBase(s[2..], 16, negative);
+        if (s[1] == 'o' or s[1] == 'O')
+            return parseIntBase(s[2..], 8, negative);
+        if (s[1] == 'b' or s[1] == 'B')
+            return parseIntBase(s[2..], 2, negative);
+        // Legacy octal: 0-prefixed all-octal digits
+        if (s.len > 1 and isOctalDigit(s[1])) {
+            if (isAllOctalOrUnderscore(s[1..])) return parseIntBase(s[1..], 8, negative);
+        }
+    }
+
+    // Detect float vs integer by presence of '.' or 'e'/'E'
+    var dot_count: usize = 0;
+    var has_e = false;
+    for (s) |c| {
+        if (c == '.') dot_count += 1;
+        if (c == 'e' or c == 'E') has_e = true;
+    }
+
+    if (dot_count > 1 and !has_e) return null; // IP address like 1.1.1.1
+    if (dot_count > 0 or has_e) return parseFloat(s, negative);
+
+    // Plain decimal integer
+    return parseIntBase(s, 10, negative);
+}
+
+fn isOctalDigit(c: u8) bool {
+    return c >= '0' and c <= '7';
+}
+
+fn isAllOctalOrUnderscore(s: []const u8) bool {
+    for (s) |c| {
+        if (c != '_' and !isOctalDigit(c)) return false;
+    }
+    return true;
+}
+
+fn parseIntBase(digits: []const u8, base: u8, negative: bool) ?NumberValue {
+    if (digits.len == 0) return null;
+    var buf: [128]u8 = undefined;
+    var len: usize = 0;
+    for (digits) |c| {
+        if (c == '_') continue;
+        if (len >= buf.len) return null;
+        buf[len] = c;
+        len += 1;
+    }
+    if (len == 0) return null;
+    const clean = buf[0..len];
+    if (negative) {
+        const n = std.fmt.parseInt(i64, clean, base) catch return null;
+        return .{ .int = -n };
+    }
+    const n = std.fmt.parseInt(i64, clean, base) catch return null;
+    return .{ .int = n };
+}
+
+fn parseFloat(s: []const u8, negative: bool) ?NumberValue {
+    var buf: [128]u8 = undefined;
+    var len: usize = 0;
+    for (s) |c| {
+        if (c == '_') continue;
+        if (len >= buf.len) return null;
+        buf[len] = c;
+        len += 1;
+    }
+    if (len == 0) return null;
+    const clean = buf[0..len];
+    const f = std.fmt.parseFloat(f64, clean) catch return null;
+    return .{ .float = if (negative) -f else f };
 }
 
 pub fn needsQuoting(val: []const u8) bool {
-    _ = val;
+    if (val.len == 0) return true;
+
+    // Reserved keywords (YAML 1.2)
+    if (reservedKeyword(val) != null) return true;
+
+    // Parseable number
+    if (toNumber(val) != null) return true;
+
+    // Leading/trailing whitespace
+    if (val[0] == ' ' or val[0] == '\t') return true;
+    if (val[val.len - 1] == ' ' or val[val.len - 1] == '\t') return true;
+
+    // Leading special characters
+    switch (val[0]) {
+        '{',
+        '}',
+        '[',
+        ']',
+        ',',
+        '!',
+        '|',
+        '>',
+        '%',
+        '\'',
+        '"',
+        '#',
+        '*',
+        '&',
+        '@',
+        '`',
+        => return true,
+        '-' => return true,
+        else => {},
+    }
+
+    // Colon at start followed by something (like :0, :value)
+    if (val[0] == ':' and val.len > 1) return true;
+
+    // Ends with colon, or contains ": " or ":\t"
+    if (val[val.len - 1] == ':') return true;
+    if (std.mem.indexOf(u8, val, ": ") != null) return true;
+    if (std.mem.indexOf(u8, val, ":\t") != null) return true;
+
+    // Sexagesimal (YAML 1.1): digits separated by colons (e.g. 1:1 = 61)
+    if (isSexagesimal(val)) return true;
+
+    // Contains " #" (comment)
+    if (std.mem.indexOf(u8, val, " #") != null) return true;
+
+    // Null byte literal
+    if (std.mem.indexOf(u8, val, "\\0") != null) return true;
+
+    // YAML 1.1 legacy bool keywords
+    if (isLegacyBool(val)) return true;
+
+    // Timestamp pattern (DDDD-DD-DD)
+    if (isTimestampLike(val)) return true;
+
+    // Overflow numbers: all digits but too large for i64
+    if (isOverflowNumber(val)) return true;
+
     return false;
 }
 
+fn isLegacyBool(val: []const u8) bool {
+    const keywords = [_][]const u8{
+        "y",   "Y",  "yes", "Yes", "YES",
+        "n",   "N",  "no",  "No",  "NO",
+        "on",  "On", "ON",  "off", "Off",
+        "OFF",
+    };
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, val, kw)) return true;
+    }
+    return false;
+}
+
+fn isTimestampLike(val: []const u8) bool {
+    // Match YYYY-MM-DD pattern
+    if (val.len < 10) return false;
+    if (!std.ascii.isDigit(val[0]) or !std.ascii.isDigit(val[1]) or
+        !std.ascii.isDigit(val[2]) or !std.ascii.isDigit(val[3])) return false;
+    if (val[4] != '-') return false;
+    if (!std.ascii.isDigit(val[5]) or !std.ascii.isDigit(val[6])) return false;
+    if (val[7] != '-') return false;
+    if (!std.ascii.isDigit(val[8]) or !std.ascii.isDigit(val[9])) return false;
+    // Bare date (YYYY-MM-DD)
+    if (val.len == 10) return true;
+    // Date followed by T/t separator
+    if (val[10] == 'T' or val[10] == 't') return true;
+    // Date followed by space+digit then colon (time component: "YYYY-MM-DD H:..." or
+    // "YYYY-MM-DD HH:..."). Verify it looks like a time by requiring a colon within
+    // the next few characters.
+    if (val[10] == ' ' and val.len > 12 and std.ascii.isDigit(val[11])) {
+        // Check for colon in the time portion (within 3 chars of the digit)
+        const time_start = 11;
+        const check_end = @min(time_start + 3, val.len);
+        for (val[time_start..check_end]) |c| {
+            if (c == ':') {
+                // Ensure no trailing " -\d" pattern (invalid timezone)
+                if (val.len >= 3) {
+                    const end = val[val.len - 2 ..];
+                    if (end[0] == '-' and std.ascii.isDigit(end[1]) and
+                        val[val.len - 3] == ' ')
+                        return false;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isSexagesimal(val: []const u8) bool {
+    if (val.len == 0) return false;
+    var has_colon = false;
+    for (val) |c| {
+        if (c == ':') {
+            has_colon = true;
+        } else if (!std.ascii.isDigit(c)) {
+            return false;
+        }
+    }
+    return has_colon;
+}
+
+fn isOverflowNumber(val: []const u8) bool {
+    if (val.len <= 19) return false; // i64 max is 19 digits
+    for (val) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
 pub fn reservedKeyword(val: []const u8) ?TokenType {
-    _ = val;
+    if (val.len == 0) return null;
+    switch (val[0]) {
+        '~' => if (val.len == 1) return .null_value,
+        'n' => {
+            if (std.mem.eql(u8, val, "null")) return .null_value;
+        },
+        'N' => {
+            if (std.mem.eql(u8, val, "Null")) return .null_value;
+            if (std.mem.eql(u8, val, "NULL")) return .null_value;
+        },
+        't' => {
+            if (std.mem.eql(u8, val, "true")) return .bool_value;
+        },
+        'T' => {
+            if (std.mem.eql(u8, val, "True")) return .bool_value;
+            if (std.mem.eql(u8, val, "TRUE")) return .bool_value;
+        },
+        'f' => {
+            if (std.mem.eql(u8, val, "false")) return .bool_value;
+        },
+        'F' => {
+            if (std.mem.eql(u8, val, "False")) return .bool_value;
+            if (std.mem.eql(u8, val, "FALSE")) return .bool_value;
+        },
+        '.' => {
+            if (std.mem.eql(u8, val, ".inf")) return .infinity;
+            if (std.mem.eql(u8, val, ".Inf")) return .infinity;
+            if (std.mem.eql(u8, val, ".INF")) return .infinity;
+            if (std.mem.eql(u8, val, ".nan")) return .nan;
+            if (std.mem.eql(u8, val, ".NaN")) return .nan;
+            if (std.mem.eql(u8, val, ".NAN")) return .nan;
+        },
+        '-' => {
+            if (std.mem.eql(u8, val, "-.inf")) return .infinity;
+            if (std.mem.eql(u8, val, "-.Inf")) return .infinity;
+            if (std.mem.eql(u8, val, "-.INF")) return .infinity;
+        },
+        else => {},
+    }
     return null;
 }
 
