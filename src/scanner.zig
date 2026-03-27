@@ -1,27 +1,735 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const Token = @import("token.zig").Token;
-const TokenType = @import("token.zig").TokenType;
+const token_mod = @import("token.zig");
+const Token = token_mod.Token;
+const TokenType = token_mod.TokenType;
+
+const Buf = std.ArrayListUnmanaged(u8);
+const LineBuf = std.ArrayListUnmanaged([]const u8);
 
 pub const Scanner = struct {
     allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
     source: []const u8,
+    pos: usize,
+    line: u32,
+    column: u32,
+    flow_level: u32,
+    tokens: std.ArrayListUnmanaged(Token),
 
     pub fn init(allocator: Allocator, source: []const u8) Scanner {
+        const arena = std.heap.ArenaAllocator.init(allocator);
         return .{
             .allocator = allocator,
+            .arena = arena,
             .source = source,
+            .pos = 0,
+            .line = 1,
+            .column = 0,
+            .flow_level = 0,
+            .tokens = .empty,
         };
     }
 
     pub fn deinit(self: *Scanner) void {
-        _ = self;
+        self.arena.deinit();
+    }
+
+    fn a(self: *Scanner) Allocator {
+        return self.arena.allocator();
     }
 
     pub fn scan(self: *Scanner) ![]Token {
-        _ = self;
-        return error.Unimplemented;
+        while (self.pos < self.source.len) {
+            self.skipWhitespaceAndNewlines();
+            if (self.pos >= self.source.len) break;
+            const c = self.source[self.pos];
+
+            if (c == '%' and self.column == 0) {
+                try self.scanDirective();
+            } else if (c == '-' and self.column == 0 and self.matchDocMarker("---")) {
+                try self.addToken(.document_header, "---");
+                self.advance(3);
+                self.skipInlineWhitespace();
+            } else if (c == '.' and self.column == 0 and self.matchDocMarker("...")) {
+                try self.addToken(.document_end, "...");
+                self.advance(3);
+            } else if (c == '#' and (self.column == 0 or self.isPrecededByWhitespace())) {
+                try self.scanComment();
+            } else if (c == '\'') {
+                try self.scanSingleQuoted();
+            } else if (c == '"') {
+                try self.scanDoubleQuoted();
+            } else if (c == '{') {
+                self.flow_level += 1;
+                try self.addToken(.mapping_start, "{");
+                self.advance(1);
+            } else if (c == '}') {
+                if (self.flow_level > 0) self.flow_level -= 1;
+                try self.addToken(.mapping_end, "}");
+                self.advance(1);
+            } else if (c == '[') {
+                self.flow_level += 1;
+                try self.addToken(.sequence_start, "[");
+                self.advance(1);
+            } else if (c == ']') {
+                if (self.flow_level > 0) self.flow_level -= 1;
+                try self.addToken(.sequence_end, "]");
+                self.advance(1);
+            } else if (c == ',') {
+                try self.addToken(.collect_entry, ",");
+                self.advance(1);
+            } else if (c == '?' and (self.pos + 1 >= self.source.len or
+                isWhitespace(self.source[self.pos + 1])))
+            {
+                try self.addToken(.mapping_key, "?");
+                self.advance(1);
+            } else if (c == ':' and self.isMappingValue()) {
+                try self.addToken(.mapping_value, ":");
+                self.advance(1);
+            } else if (c == '-' and self.isSequenceEntry()) {
+                try self.addToken(.sequence_entry, "-");
+                self.advance(1);
+            } else if (c == '|' or c == '>') {
+                try self.scanBlockScalar();
+            } else if (c == '&') {
+                try self.scanAnchor();
+            } else if (c == '*') {
+                try self.scanAlias();
+            } else if (c == '!') {
+                try self.scanTag();
+            } else {
+                try self.scanPlainScalar();
+            }
+        }
+        return self.tokens.items;
+    }
+
+    fn advance(self: *Scanner, n: usize) void {
+        for (0..n) |_| {
+            if (self.pos < self.source.len) {
+                if (self.source[self.pos] == '\n') {
+                    self.line += 1;
+                    self.column = 0;
+                } else if (self.source[self.pos] == '\r') {
+                    self.line += 1;
+                    self.column = 0;
+                    if (self.pos + 1 < self.source.len and
+                        self.source[self.pos + 1] == '\n')
+                    {
+                        self.pos += 1;
+                    }
+                } else {
+                    self.column += 1;
+                }
+                self.pos += 1;
+            }
+        }
+    }
+
+    fn addToken(self: *Scanner, tt: TokenType, val: []const u8) !void {
+        try self.tokens.append(self.a(), .{ .token_type = tt, .value = val });
+    }
+
+    fn bufAppend(self: *Scanner, buf: *Buf, ch: u8) !void {
+        try buf.append(self.a(), ch);
+    }
+
+    fn bufAppendSlice(self: *Scanner, buf: *Buf, slice: []const u8) !void {
+        try buf.appendSlice(self.a(), slice);
+    }
+
+    fn lineAppend(self: *Scanner, lines: *LineBuf, val: []const u8) !void {
+        try lines.append(self.a(), val);
+    }
+
+    fn isWhitespace(c: u8) bool {
+        return c == ' ' or c == '\t';
+    }
+
+    fn isNewline(c: u8) bool {
+        return c == '\n' or c == '\r';
+    }
+
+    fn isWhitespaceOrNewline(c: u8) bool {
+        return isWhitespace(c) or isNewline(c);
+    }
+
+    fn isFlowIndicator(c: u8) bool {
+        return c == '{' or c == '}' or c == '[' or c == ']' or c == ',';
+    }
+
+    fn isPrecededByWhitespace(self: *Scanner) bool {
+        if (self.pos == 0) return true;
+        const prev = self.source[self.pos - 1];
+        return isWhitespace(prev) or isNewline(prev);
+    }
+
+    fn skipWhitespaceAndNewlines(self: *Scanner) void {
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (isWhitespaceOrNewline(c)) {
+                self.advance(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn skipInlineWhitespace(self: *Scanner) void {
+        while (self.pos < self.source.len and isWhitespace(self.source[self.pos])) {
+            self.advance(1);
+        }
+    }
+
+    fn matchDocMarker(self: *Scanner, marker: []const u8) bool {
+        if (self.pos + marker.len > self.source.len) return false;
+        if (!std.mem.eql(u8, self.source[self.pos .. self.pos + marker.len], marker))
+            return false;
+        if (self.pos + marker.len >= self.source.len) return true;
+        const after = self.source[self.pos + marker.len];
+        return isWhitespaceOrNewline(after);
+    }
+
+    fn isMappingValue(self: *Scanner) bool {
+        if (self.flow_level > 0) {
+            if (self.pos + 1 >= self.source.len) return true;
+            const next = self.source[self.pos + 1];
+            return next != ':' and (isWhitespace(next) or isNewline(next) or
+                isFlowIndicator(next) or next == '"' or next == '\'' or
+                next == '!' or next == '&' or next == '*');
+        }
+        if (self.pos + 1 >= self.source.len) return true;
+        const next = self.source[self.pos + 1];
+        return isWhitespace(next) or isNewline(next);
+    }
+
+    fn isSequenceEntry(self: *Scanner) bool {
+        if (self.pos + 1 >= self.source.len) return true;
+        const next = self.source[self.pos + 1];
+        return isWhitespace(next) or isNewline(next);
+    }
+
+    fn scanDirective(self: *Scanner) !void {
+        const start = self.pos;
+        while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
+            self.advance(1);
+        }
+        try self.addToken(.directive, self.source[start..self.pos]);
+    }
+
+    fn scanComment(self: *Scanner) !void {
+        self.advance(1); // skip #
+        const start = self.pos;
+        while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
+            self.advance(1);
+        }
+        try self.addToken(.comment, self.source[start..self.pos]);
+    }
+
+    fn scanSingleQuoted(self: *Scanner) !void {
+        self.advance(1); // skip opening '
+        var buf: Buf = .empty;
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (c == '\'') {
+                if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\'') {
+                    try self.bufAppend(&buf, '\'');
+                    self.advance(2);
+                } else {
+                    self.advance(1);
+                    break;
+                }
+            } else {
+                try self.bufAppend(&buf, c);
+                self.advance(1);
+            }
+        }
+        try self.addToken(.single_quote, buf.items);
+    }
+
+    fn scanDoubleQuoted(self: *Scanner) !void {
+        self.advance(1); // skip opening "
+        var buf: Buf = .empty;
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (c == '"') {
+                self.advance(1);
+                break;
+            } else if (c == '\\') {
+                if (self.pos + 1 < self.source.len) {
+                    const next = self.source[self.pos + 1];
+                    if (isNewline(next)) {
+                        self.advance(1); // skip backslash
+                        self.advance(1); // skip newline
+                        while (self.pos < self.source.len and
+                            isWhitespace(self.source[self.pos]))
+                            self.advance(1);
+                    } else {
+                        self.advance(1); // skip backslash
+                        try self.appendEscapeChar(&buf, next);
+                        self.advance(1);
+                    }
+                } else {
+                    try self.bufAppend(&buf, c);
+                    self.advance(1);
+                }
+            } else if (isNewline(c)) {
+                self.advance(1);
+                var blank_lines: usize = 0;
+                while (self.pos < self.source.len) {
+                    while (self.pos < self.source.len and
+                        isWhitespace(self.source[self.pos]))
+                        self.advance(1);
+                    if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+                        blank_lines += 1;
+                        self.advance(1);
+                    } else {
+                        break;
+                    }
+                }
+                if (blank_lines > 0) {
+                    for (0..blank_lines) |_| try self.bufAppend(&buf, '\n');
+                } else {
+                    try self.bufAppend(&buf, ' ');
+                }
+            } else {
+                try self.bufAppend(&buf, c);
+                self.advance(1);
+            }
+        }
+        try self.addToken(.double_quote, buf.items);
+    }
+
+    fn appendEscapeChar(self: *Scanner, buf: *Buf, c: u8) !void {
+        switch (c) {
+            'n' => try self.bufAppend(buf, '\n'),
+            't' => try self.bufAppend(buf, '\t'),
+            'r' => try self.bufAppend(buf, '\r'),
+            '\\' => try self.bufAppend(buf, '\\'),
+            '"' => try self.bufAppend(buf, '"'),
+            '0' => try self.bufAppend(buf, 0),
+            'a' => try self.bufAppend(buf, 0x07),
+            'b' => try self.bufAppend(buf, 0x08),
+            'f' => try self.bufAppend(buf, 0x0C),
+            'v' => try self.bufAppend(buf, 0x0B),
+            'e' => try self.bufAppend(buf, 0x1B),
+            ' ' => try self.bufAppend(buf, ' '),
+            '/' => try self.bufAppend(buf, '/'),
+            else => {
+                try self.bufAppend(buf, '\\');
+                try self.bufAppend(buf, c);
+            },
+        }
+    }
+
+    fn scanBlockScalar(self: *Scanner) !void {
+        const is_literal = self.source[self.pos] == '|';
+        const tt: TokenType = if (is_literal) .literal else .folded;
+        const header_start = self.pos;
+        self.advance(1);
+
+        var chomp: enum { clip, strip, keep } = .clip;
+        var explicit_indent: ?u32 = null;
+
+        while (self.pos < self.source.len and
+            !isNewline(self.source[self.pos]) and
+            !isWhitespace(self.source[self.pos]) and
+            self.source[self.pos] != '#')
+        {
+            const c = self.source[self.pos];
+            if (c == '-') {
+                chomp = .strip;
+                self.advance(1);
+            } else if (c == '+') {
+                chomp = .keep;
+                self.advance(1);
+            } else if (c >= '1' and c <= '9') {
+                explicit_indent = c - '0';
+                self.advance(1);
+            } else {
+                break;
+            }
+        }
+
+        const header_val = self.source[header_start..self.pos];
+        try self.addToken(tt, header_val);
+
+        self.skipInlineWhitespace();
+        if (self.pos < self.source.len and self.source[self.pos] == '#') {
+            try self.scanComment();
+        }
+
+        if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+            self.advance(1);
+        } else {
+            return;
+        }
+
+        var content_lines: LineBuf = .empty;
+        var trailing_blank_lines: usize = 0;
+        var has_trailing_newline = false;
+        var content_indent: ?u32 = null;
+
+        if (explicit_indent) |ei| {
+            content_indent = ei;
+        }
+
+        // Collect lines: each iteration processes one line
+        // pending_blanks tracks blank lines seen since last content line
+        var pending_blanks: usize = 0;
+
+        while (self.pos < self.source.len) {
+            // Count leading spaces
+            var line_spaces: u32 = 0;
+            var tmp_pos = self.pos;
+            while (tmp_pos < self.source.len and self.source[tmp_pos] == ' ') {
+                line_spaces += 1;
+                tmp_pos += 1;
+            }
+
+            const at_eol = tmp_pos >= self.source.len or isNewline(self.source[tmp_pos]);
+
+            // Before content_indent is known, blank lines are just pending
+            if (content_indent == null) {
+                if (at_eol) {
+                    pending_blanks += 1;
+                    self.pos = tmp_pos;
+                    if (self.pos < self.source.len) self.advance(1);
+                    continue;
+                }
+                if (line_spaces == 0) break;
+                content_indent = line_spaces;
+            }
+
+            const ci = content_indent.?;
+
+            // Lines with < ci spaces that are blank → pending blank
+            // Lines with < ci spaces that are NOT blank → end of block
+            if (line_spaces < ci) {
+                if (at_eol) {
+                    pending_blanks += 1;
+                    self.pos = tmp_pos;
+                    if (self.pos < self.source.len) self.advance(1);
+                    continue;
+                }
+                break;
+            }
+
+            // Lines with >= ci spaces: content line (even if only whitespace after indent)
+            for (0..pending_blanks) |_| try self.lineAppend(&content_lines, "");
+            pending_blanks = 0;
+
+            self.pos += ci;
+            self.column = ci;
+
+            const content_start = self.pos;
+            while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            try self.lineAppend(&content_lines, self.source[content_start..self.pos]);
+
+            if (self.pos < self.source.len) {
+                self.advance(1);
+                has_trailing_newline = true;
+            } else {
+                has_trailing_newline = false;
+            }
+        }
+
+        // pending_blanks at end = trailing blank lines after last content
+        trailing_blank_lines = pending_blanks;
+
+        if (content_lines.items.len == 0) return;
+
+        var buf: Buf = .empty;
+
+        if (is_literal) {
+            for (content_lines.items, 0..) |line, idx| {
+                if (idx > 0) try self.bufAppend(&buf, '\n');
+                try self.bufAppendSlice(&buf, line);
+            }
+        } else {
+            // Folded: same-indent lines joined with space,
+            // more-indented lines preserve newlines.
+            // Between each pair of lines, we add a separator:
+            //   blank line → \n (already counted)
+            //   either line more-indented → \n
+            //   both normal → space
+            for (content_lines.items, 0..) |line, idx| {
+                if (idx > 0) {
+                    const prev = content_lines.items[idx - 1];
+                    const prev_blank = prev.len == 0;
+                    const prev_mi = prev.len > 0 and prev[0] == ' ';
+                    const cur_blank = line.len == 0;
+                    const cur_mi = line.len > 0 and line[0] == ' ';
+
+                    if (prev_blank or cur_blank) {
+                        try self.bufAppend(&buf, '\n');
+                    } else if (prev_mi or cur_mi) {
+                        try self.bufAppend(&buf, '\n');
+                    } else {
+                        try self.bufAppend(&buf, ' ');
+                    }
+                }
+                try self.bufAppendSlice(&buf, line);
+            }
+        }
+
+        // Determine if the block had any trailing newline
+        const had_newline = has_trailing_newline or trailing_blank_lines > 0 or
+            content_lines.items.len > 1;
+
+        // Apply chomping
+        switch (chomp) {
+            .clip => {
+                while (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n')
+                    buf.items.len -= 1;
+                if (had_newline) try self.bufAppend(&buf, '\n');
+            },
+            .strip => {
+                while (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n')
+                    buf.items.len -= 1;
+            },
+            .keep => {
+                while (buf.items.len > 0 and buf.items[buf.items.len - 1] == '\n')
+                    buf.items.len -= 1;
+                const total = 1 + trailing_blank_lines;
+                for (0..total) |_| try self.bufAppend(&buf, '\n');
+            },
+        }
+
+        try self.addToken(.string, buf.items);
+    }
+
+    fn scanAnchor(self: *Scanner) !void {
+        self.advance(1);
+        while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
+            !isFlowIndicator(self.source[self.pos]))
+            self.advance(1);
+        try self.addToken(.anchor, "&");
+    }
+
+    fn scanAlias(self: *Scanner) !void {
+        self.advance(1);
+        while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
+            !isFlowIndicator(self.source[self.pos]) and self.source[self.pos] != ':')
+            self.advance(1);
+        try self.addToken(.alias, "*");
+    }
+
+    fn scanTag(self: *Scanner) !void {
+        const start = self.pos;
+        self.advance(1);
+        while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
+            !isFlowIndicator(self.source[self.pos]))
+            self.advance(1);
+        try self.addToken(.tag, self.source[start..self.pos]);
+    }
+
+    fn scanPlainScalar(self: *Scanner) !void {
+        if (self.isMergeKey()) {
+            try self.addToken(.merge_key, "<<");
+            self.advance(2);
+            return;
+        }
+
+        const start = self.pos;
+        const start_col = self.column;
+
+        var end = self.pos;
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (isNewline(c)) break;
+            if (self.flow_level > 0 and isFlowIndicator(c)) break;
+            if (c == ':' and self.isMappingValue()) break;
+            if (c == '#' and self.isPrecededByWhitespace()) break;
+            self.advance(1);
+            end = self.pos;
+        }
+
+        while (end > start and isWhitespace(self.source[end - 1])) end -= 1;
+
+        if (self.flow_level == 0 and self.pos < self.source.len and
+            isNewline(self.source[self.pos]))
+        {
+            var buf: ?Buf = null;
+
+            while (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+                const saved_pos = self.pos;
+                const saved_line = self.line;
+                const saved_col = self.column;
+                self.advance(1);
+
+                var blank_count: usize = 0;
+                while (self.pos < self.source.len) {
+                    const bpos = self.pos;
+                    while (self.pos < self.source.len and self.source[self.pos] == ' ')
+                        self.advance(1);
+                    if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+                        blank_count += 1;
+                        self.advance(1);
+                    } else {
+                        self.pos = bpos;
+                        self.column = saved_col;
+                        break;
+                    }
+                }
+
+                var next_indent: u32 = 0;
+                while (self.pos < self.source.len and self.source[self.pos] == ' ') {
+                    next_indent += 1;
+                    self.advance(1);
+                }
+
+                if (self.pos >= self.source.len or isNewline(self.source[self.pos]) or
+                    next_indent < start_col)
+                {
+                    self.pos = saved_pos;
+                    self.line = saved_line;
+                    self.column = saved_col;
+                    break;
+                }
+
+                if (self.looksLikeNewKey() or self.looksLikeSequenceEntry() or
+                    self.looksLikeDocMarker())
+                {
+                    self.pos = saved_pos;
+                    self.line = saved_line;
+                    self.column = saved_col;
+                    break;
+                }
+
+                if (buf == null) {
+                    buf = .empty;
+                    try self.bufAppendSlice(&buf.?, self.source[start..end]);
+                }
+
+                if (blank_count > 0) {
+                    try self.bufAppend(&buf.?, '\n');
+                } else {
+                    try self.bufAppend(&buf.?, ' ');
+                }
+
+                const cont_start = self.pos;
+                while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
+                    const cc = self.source[self.pos];
+                    if (cc == ':' and self.isMappingValue()) break;
+                    if (cc == '#' and self.isPrecededByWhitespace()) break;
+                    self.advance(1);
+                }
+                var cont_end = self.pos;
+                while (cont_end > cont_start and isWhitespace(self.source[cont_end - 1]))
+                    cont_end -= 1;
+                try self.bufAppendSlice(&buf.?, self.source[cont_start..cont_end]);
+                end = cont_end;
+            }
+
+            if (buf) |b| {
+                try self.addPlainToken(b.items);
+                return;
+            }
+        }
+
+        try self.addPlainToken(self.source[start..end]);
+    }
+
+    fn addPlainToken(self: *Scanner, val: []const u8) !void {
+        // After a tag, plain values are always strings
+        if (self.lastTokenType() == .tag) {
+            try self.addToken(.string, val);
+            return;
+        }
+        if (token_mod.reservedKeyword(val)) |kw_type| {
+            try self.addToken(kw_type, val);
+        } else if (isInvalidLeadingZero(val)) {
+            try self.addToken(.string, val);
+        } else if (token_mod.toNumber(val) != null) {
+            const num = token_mod.toNumber(val).?;
+            switch (num) {
+                .int => try self.addToken(.integer, val),
+                .float => try self.addToken(.float, val),
+            }
+        } else {
+            try self.addToken(.string, val);
+        }
+    }
+
+    fn lastTokenType(self: *Scanner) ?TokenType {
+        if (self.tokens.items.len == 0) return null;
+        return self.tokens.items[self.tokens.items.len - 1].token_type;
+    }
+
+    fn isInvalidLeadingZero(val: []const u8) bool {
+        // Reject "0" followed by digits that look like bad octal (e.g. "098765")
+        if (val.len < 2) return false;
+        var s = val;
+        if (s[0] == '+' or s[0] == '-') s = s[1..];
+        if (s.len < 2 or s[0] != '0') return false;
+        // Valid prefixes: 0x, 0o, 0b, 0. (float), 0e (float)
+        if (s.len >= 2) {
+            const c = s[1];
+            if (c == 'x' or c == 'X' or c == 'o' or c == 'O' or
+                c == 'b' or c == 'B' or c == '.' or c == 'e' or c == 'E')
+                return false;
+        }
+        // If second char is a digit (not 0x/0o/0b prefix), it's legacy octal territory
+        // Check if all remaining chars are valid octal digits/underscores
+        if (!std.ascii.isDigit(s[1])) return false;
+        for (s[1..]) |c| {
+            if (c == '_') continue;
+            if (c < '0' or c > '7') return true; // has non-octal digit → invalid
+        }
+        return false;
+    }
+
+    fn isMergeKey(self: *Scanner) bool {
+        if (self.pos + 1 >= self.source.len) return false;
+        if (self.source[self.pos] != '<' or self.source[self.pos + 1] != '<') return false;
+        if (self.pos + 2 >= self.source.len) return false;
+        var p = self.pos + 2;
+        while (p < self.source.len and isWhitespace(self.source[p])) p += 1;
+        if (p >= self.source.len) return false;
+        if (self.source[p] != ':') return false;
+        if (p + 1 >= self.source.len) return true;
+        const after_colon = self.source[p + 1];
+        return isWhitespace(after_colon) or isNewline(after_colon) or
+            isFlowIndicator(after_colon);
+    }
+
+    fn looksLikeNewKey(self: *Scanner) bool {
+        var p = self.pos;
+        while (p < self.source.len and !isNewline(self.source[p])) {
+            const c = self.source[p];
+            if (c == ':') {
+                if (p + 1 >= self.source.len) return true;
+                const next = self.source[p + 1];
+                if (isWhitespace(next) or isNewline(next)) return true;
+            }
+            if (c == '\'' or c == '"') return false;
+            p += 1;
+        }
+        return false;
+    }
+
+    fn looksLikeSequenceEntry(self: *Scanner) bool {
+        if (self.pos >= self.source.len) return false;
+        if (self.source[self.pos] != '-') return false;
+        if (self.pos + 1 >= self.source.len) return true;
+        return isWhitespace(self.source[self.pos + 1]) or
+            isNewline(self.source[self.pos + 1]);
+    }
+
+    fn looksLikeDocMarker(self: *Scanner) bool {
+        if (self.pos + 2 >= self.source.len) return false;
+        const slice = self.source[self.pos .. self.pos + 3];
+        if (std.mem.eql(u8, slice, "---") or std.mem.eql(u8, slice, "...")) {
+            if (self.pos + 3 >= self.source.len) return true;
+            return isWhitespaceOrNewline(self.source[self.pos + 3]);
+        }
+        return false;
     }
 };
 
@@ -1908,7 +2616,6 @@ test "scan anchor without value" {
         &.{ "a", ":", "b", ":", "&", "c", ":", "&", "d", ":", "e" },
     );
 }
-
 
 test "scan literal keep plus" {
     try expectTokenTypesAndValues(
