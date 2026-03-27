@@ -8,7 +8,6 @@ pub const decoder = @import("decode.zig");
 pub const emitter = @import("emitter.zig");
 pub const encoder = @import("encode.zig");
 pub const err = @import("error.zig");
-pub const grouper = @import("grouper.zig");
 pub const parser = @import("parser.zig");
 pub const scanner = @import("scanner.zig");
 pub const suite = @import("suite.zig");
@@ -66,7 +65,6 @@ test {
     _ = err;
     _ = scanner;
     _ = parser;
-    _ = grouper;
     _ = emitter;
     _ = decoder;
     _ = encoder;
