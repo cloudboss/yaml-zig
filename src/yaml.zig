@@ -44,6 +44,12 @@ pub fn parse(allocator: Allocator, source: []const u8) !Document {
     var s = scanner.Scanner.init(arena_alloc, source);
     const tokens = try s.scan();
 
+    // Link tokens via prev/next for emitter traversal.
+    for (tokens, 0..) |*t, i| {
+        if (i > 0) t.prev = &tokens[i - 1];
+        if (i + 1 < tokens.len) t.next = &tokens[i + 1];
+    }
+
     var p = parser.Parser.init(arena_alloc);
     const root = try p.parse(tokens);
 
@@ -135,7 +141,8 @@ pub fn parseAll(allocator: Allocator, source: []const u8) !File {
 }
 
 pub fn emit(allocator: Allocator, doc: Document) ![]u8 {
-    return emitter.emit(allocator, doc);
+    const body = doc.body orelse return error.Unimplemented;
+    return emitter.emit(allocator, body.*, .{});
 }
 
 pub fn decode(comptime T: type, allocator: Allocator, source: []const u8) !T {
