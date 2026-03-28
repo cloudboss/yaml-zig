@@ -15,39 +15,127 @@ pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 
 pub const Document = struct {
-    allocator: Allocator,
+    arena: ?std.heap.ArenaAllocator = null,
     body: ?*Node = null,
 
     pub fn deinit(self: *Document) void {
-        _ = self;
+        if (self.arena) |*a| {
+            a.deinit();
+        }
     }
 };
 
 pub const File = struct {
-    allocator: Allocator,
+    arena: ?std.heap.ArenaAllocator = null,
     docs: []Document = &.{},
 
     pub fn deinit(self: *File) void {
-        _ = self;
+        if (self.arena) |*a| {
+            a.deinit();
+        }
     }
 };
 
 pub fn parse(allocator: Allocator, source: []const u8) !Document {
-    _ = allocator;
-    _ = source;
-    return error.Unimplemented;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var s = scanner.Scanner.init(arena_alloc, source);
+    const tokens = try s.scan();
+
+    var p = parser.Parser.init(arena_alloc);
+    const root = try p.parse(tokens);
+
+    var body_ptr: ?*Node = null;
+    switch (root) {
+        .document => |d| {
+            body_ptr = if (d.body) |b| @constCast(b) else null;
+        },
+        else => {
+            const node = try arena_alloc.create(Node);
+            node.* = root;
+            body_ptr = node;
+        },
+    }
+
+    return Document{
+        .arena = arena,
+        .body = body_ptr,
+    };
 }
 
 pub fn parseAll(allocator: Allocator, source: []const u8) !File {
-    _ = allocator;
-    _ = source;
-    return error.Unimplemented;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var s = scanner.Scanner.init(arena_alloc, source);
+    const tokens = try s.scan();
+
+    // Split tokens by document headers
+    var docs = std.ArrayListUnmanaged(Document){};
+    var doc_start: usize = 0;
+    var i: usize = 0;
+    var found_header = false;
+
+    while (i < tokens.len) {
+        if (tokens[i].token_type == .document_header) {
+            if (found_header or doc_start < i) {
+                // Parse previous document
+                var p = parser.Parser.init(arena_alloc);
+                const root = try p.parse(tokens[doc_start..i]);
+                var body_ptr: ?*Node = null;
+                switch (root) {
+                    .document => |d| {
+                        body_ptr = if (d.body) |b| @constCast(b) else null;
+                    },
+                    else => {
+                        const node = try arena_alloc.create(Node);
+                        node.* = root;
+                        body_ptr = node;
+                    },
+                }
+                try docs.append(arena_alloc, .{
+                    .body = body_ptr,
+                });
+            }
+            doc_start = i;
+            found_header = true;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Parse last document
+    if (doc_start < tokens.len) {
+        var p = parser.Parser.init(arena_alloc);
+        const root = try p.parse(tokens[doc_start..]);
+        var body_ptr: ?*Node = null;
+        switch (root) {
+            .document => |d| {
+                body_ptr = if (d.body) |b| @constCast(b) else null;
+            },
+            else => {
+                const node = try arena_alloc.create(Node);
+                node.* = root;
+                body_ptr = node;
+            },
+        }
+        try docs.append(arena_alloc, .{
+            .body = body_ptr,
+        });
+    }
+
+    return File{
+        .arena = arena,
+        .docs = docs.items,
+    };
 }
 
 pub fn emit(allocator: Allocator, doc: Document) ![]u8 {
-    _ = allocator;
-    _ = doc;
-    return error.Unimplemented;
+    return emitter.emit(allocator, doc);
 }
 
 pub fn decode(comptime T: type, allocator: Allocator, source: []const u8) !T {
