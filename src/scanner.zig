@@ -17,6 +17,13 @@ pub const Scanner = struct {
     column: u32,
     flow_level: u32,
     tokens: std.ArrayListUnmanaged(Token),
+    line_indent: u32 = 0,
+    at_line_start: bool = true,
+    token_line: u32 = 1,
+    token_column: u32 = 0,
+    token_offset: u32 = 0,
+    token_indent: u32 = 0,
+    last_key_indent: u32 = 0,
 
     pub fn init(allocator: Allocator, source: []const u8) Scanner {
         const arena = std.heap.ArenaAllocator.init(allocator);
@@ -29,6 +36,8 @@ pub const Scanner = struct {
             .column = 0,
             .flow_level = 0,
             .tokens = .empty,
+            .line_indent = 0,
+            .at_line_start = true,
         };
     }
 
@@ -42,8 +51,12 @@ pub const Scanner = struct {
 
     pub fn scan(self: *Scanner) ![]Token {
         while (self.pos < self.source.len) {
-            self.skipWhitespaceAndNewlines();
+            try self.skipWhitespaceAndNewlines();
             if (self.pos >= self.source.len) break;
+            self.token_line = self.line;
+            self.token_column = self.column;
+            self.token_offset = @intCast(self.pos);
+            self.token_indent = self.line_indent;
             const c = self.source[self.pos];
 
             if (c == '%' and self.column == 0) {
@@ -99,6 +112,8 @@ pub const Scanner = struct {
                 try self.scanAlias();
             } else if (c == '!') {
                 try self.scanTag();
+            } else if (c == '@' or c == '`') {
+                return error.SyntaxError;
             } else {
                 try self.scanPlainScalar();
             }
@@ -129,7 +144,43 @@ pub const Scanner = struct {
     }
 
     fn addToken(self: *Scanner, tt: TokenType, val: []const u8) !void {
-        try self.tokens.append(self.a(), .{ .token_type = tt, .value = val });
+        if (tt == .mapping_value) {
+            // Track the key's indent for multiline continuation
+            if (self.tokens.items.len > 0) {
+                self.last_key_indent =
+                    self.tokens.items[self.tokens.items.len - 1]
+                        .position.indent_num;
+            }
+        }
+        try self.tokens.append(self.a(), .{
+            .token_type = tt,
+            .value = val,
+            .position = .{
+                .line = self.token_line,
+                .column = self.token_column,
+                .offset = self.token_offset,
+                .indent_num = self.token_indent,
+            },
+        });
+    }
+
+    fn addTokenWithOrigin(
+        self: *Scanner,
+        tt: TokenType,
+        val: []const u8,
+        origin: []const u8,
+    ) !void {
+        try self.tokens.append(self.a(), .{
+            .token_type = tt,
+            .value = val,
+            .origin = origin,
+            .position = .{
+                .line = self.token_line,
+                .column = self.token_column,
+                .offset = self.token_offset,
+                .indent_num = self.token_indent,
+            },
+        });
     }
 
     fn bufAppend(self: *Scanner, buf: *Buf, ch: u8) !void {
@@ -166,12 +217,23 @@ pub const Scanner = struct {
         return isWhitespace(prev) or isNewline(prev);
     }
 
-    fn skipWhitespaceAndNewlines(self: *Scanner) void {
+    fn skipWhitespaceAndNewlines(self: *Scanner) !void {
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            if (isWhitespaceOrNewline(c)) {
+            if (isNewline(c)) {
+                self.advance(1);
+                self.at_line_start = true;
+                self.line_indent = 0;
+            } else if (isWhitespace(c)) {
+                if (self.at_line_start and c == '\t' and self.flow_level == 0) {
+                    return error.TabInIndent;
+                }
+                if (self.at_line_start and c == ' ') {
+                    self.line_indent += 1;
+                }
                 self.advance(1);
             } else {
+                self.at_line_start = false;
                 break;
             }
         }
@@ -231,6 +293,7 @@ pub const Scanner = struct {
     fn scanSingleQuoted(self: *Scanner) !void {
         self.advance(1); // skip opening '
         var buf: Buf = .empty;
+        var closed = false;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
             if (c == '\'') {
@@ -239,6 +302,7 @@ pub const Scanner = struct {
                     self.advance(2);
                 } else {
                     self.advance(1);
+                    closed = true;
                     break;
                 }
             } else {
@@ -246,16 +310,19 @@ pub const Scanner = struct {
                 self.advance(1);
             }
         }
+        if (!closed) return error.UnexpectedEof;
         try self.addToken(.single_quote, buf.items);
     }
 
     fn scanDoubleQuoted(self: *Scanner) !void {
         self.advance(1); // skip opening "
         var buf: Buf = .empty;
+        var closed = false;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
             if (c == '"') {
                 self.advance(1);
+                closed = true;
                 break;
             } else if (c == '\\') {
                 if (self.pos + 1 < self.source.len) {
@@ -299,6 +366,7 @@ pub const Scanner = struct {
                 self.advance(1);
             }
         }
+        if (!closed) return error.UnexpectedEof;
         try self.addToken(.double_quote, buf.items);
     }
 
@@ -349,7 +417,7 @@ pub const Scanner = struct {
                 explicit_indent = c - '0';
                 self.advance(1);
             } else {
-                break;
+                return error.SyntaxError;
             }
         }
 
@@ -505,19 +573,21 @@ pub const Scanner = struct {
     }
 
     fn scanAnchor(self: *Scanner) !void {
+        const name_start = self.pos + 1;
         self.advance(1);
         while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
             !isFlowIndicator(self.source[self.pos]))
             self.advance(1);
-        try self.addToken(.anchor, "&");
+        try self.addTokenWithOrigin(.anchor, "&", self.source[name_start..self.pos]);
     }
 
     fn scanAlias(self: *Scanner) !void {
+        const name_start = self.pos + 1;
         self.advance(1);
         while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
             !isFlowIndicator(self.source[self.pos]) and self.source[self.pos] != ':')
             self.advance(1);
-        try self.addToken(.alias, "*");
+        try self.addTokenWithOrigin(.alias, "*", self.source[name_start..self.pos]);
     }
 
     fn scanTag(self: *Scanner) !void {
@@ -537,7 +607,11 @@ pub const Scanner = struct {
         }
 
         const start = self.pos;
-        const start_col = self.column;
+        const after_mapping_value = self.lastTokenType() == .mapping_value;
+        const base_indent = if (after_mapping_value)
+            self.last_key_indent
+        else
+            self.line_indent;
 
         var end = self.pos;
         while (self.pos < self.source.len) {
@@ -584,8 +658,10 @@ pub const Scanner = struct {
                     self.advance(1);
                 }
 
-                if (self.pos >= self.source.len or isNewline(self.source[self.pos]) or
-                    next_indent < start_col)
+                if (self.pos >= self.source.len or
+                    isNewline(self.source[self.pos]) or
+                    (after_mapping_value and next_indent <= base_indent) or
+                    (!after_mapping_value and next_indent < base_indent))
                 {
                     self.pos = saved_pos;
                     self.line = saved_line;
@@ -593,7 +669,10 @@ pub const Scanner = struct {
                     break;
                 }
 
-                if (self.looksLikeNewKey() or self.looksLikeSequenceEntry() or
+                if (self.source[self.pos] == '#' or
+                    self.looksLikeNewKey() or
+                    (self.looksLikeSequenceEntry() and
+                        next_indent <= base_indent) or
                     self.looksLikeDocMarker())
                 {
                     self.pos = saved_pos;
@@ -708,7 +787,15 @@ pub const Scanner = struct {
                 const next = self.source[p + 1];
                 if (isWhitespace(next) or isNewline(next)) return true;
             }
-            if (c == '\'' or c == '"') return false;
+            if (c == '\'' or c == '"') {
+                // Skip past closing quote to check for ':'
+                const q = c;
+                p += 1;
+                while (p < self.source.len and self.source[p] != q)
+                    p += 1;
+                if (p < self.source.len) p += 1; // skip close
+                continue;
+            }
             p += 1;
         }
         return false;
