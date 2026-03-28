@@ -512,6 +512,13 @@ pub const Scanner = struct {
 
         if (content_lines.items.len == 0) return;
 
+        // Build raw (literal-style) content for round-trip of folded blocks.
+        var raw_buf: Buf = .empty;
+        for (content_lines.items, 0..) |line, idx| {
+            if (idx > 0) try self.bufAppend(&raw_buf, '\n');
+            try self.bufAppendSlice(&raw_buf, line);
+        }
+
         var buf: Buf = .empty;
 
         if (is_literal) {
@@ -569,7 +576,7 @@ pub const Scanner = struct {
             },
         }
 
-        try self.addToken(.string, buf.items);
+        try self.addTokenWithOrigin(.string, buf.items, raw_buf.items);
     }
 
     fn scanAnchor(self: *Scanner) !void {
