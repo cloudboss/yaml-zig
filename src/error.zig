@@ -12,9 +12,29 @@ pub const Detail = struct {
     context_position: ?token.Position = null,
 
     pub fn format(self: Detail, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        _ = allocator;
-        return error.Unimplemented;
+        if (self.context_message.len > 0) {
+            if (self.context_position) |cp| {
+                return std.fmt.allocPrint(allocator,
+                    \\{s} at line {d}, column {d}
+                    \\{s} at line {d}, column {d}
+                , .{
+                    self.message,
+                    if (self.position) |p| p.line else 0,
+                    if (self.position) |p| p.column else 0,
+                    self.context_message,
+                    cp.line,
+                    cp.column,
+                });
+            }
+        }
+        if (self.position) |p| {
+            return std.fmt.allocPrint(
+                allocator,
+                "{s} at line {d}, column {d}",
+                .{ self.message, p.line, p.column },
+            );
+        }
+        return std.fmt.allocPrint(allocator, "{s}", .{self.message});
     }
 };
 
