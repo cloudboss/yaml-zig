@@ -5,6 +5,7 @@ const testing = std.testing;
 const decoder = @import("decode.zig");
 const Node = @import("ast.zig").Node;
 const Value = @import("value.zig").Value;
+const token = @import("token.zig");
 
 pub const EncodeOptions = struct {
     indent: u8 = 2,
@@ -16,10 +17,14 @@ pub const EncodeOptions = struct {
 };
 
 pub fn encode(allocator: Allocator, val: anytype, options: EncodeOptions) ![]u8 {
-    _ = allocator;
-    _ = val;
-    _ = options;
-    return error.Unimplemented;
+    var list = std.ArrayListUnmanaged(u8){};
+    errdefer list.deinit(allocator);
+    const writer = list.writer(allocator);
+    try writeValue(@TypeOf(val), writer, val, 0, options, false);
+    if (list.items.len == 0 or list.items[list.items.len - 1] != '\n') {
+        try writer.writeByte('\n');
+    }
+    return list.toOwnedSlice(allocator);
 }
 
 pub fn encodeToNode(allocator: Allocator, val: anytype, options: EncodeOptions) !Node {
@@ -27,6 +32,667 @@ pub fn encodeToNode(allocator: Allocator, val: anytype, options: EncodeOptions) 
     _ = val;
     _ = options;
     return error.Unimplemented;
+}
+
+fn writeIndent(writer: anytype, depth: u32, indent_size: u8) !void {
+    var i: u32 = 0;
+    while (i < depth * indent_size) : (i += 1) {
+        try writer.writeByte(' ');
+    }
+}
+
+fn writeValue(
+    comptime T: type,
+    writer: anytype,
+    val: T,
+    depth: u32,
+    options: EncodeOptions,
+    flow: bool,
+) !void {
+    const ti = @typeInfo(T);
+    if (flow or options.flow_style) {
+        return writeFlowValue(T, writer, val, options);
+    }
+    switch (ti) {
+        .bool => try writer.writeAll(if (val) "true" else "false"),
+        .int, .comptime_int => try writer.print("{d}", .{val}),
+        .float, .comptime_float => try writeFloat(T, writer, val),
+        .optional => {
+            if (val) |v| {
+                try writeValue(@TypeOf(v), writer, v, depth, options, false);
+            } else {
+                try writer.writeAll("null");
+            }
+        },
+        .pointer => |ptr| {
+            if (comptime isString(T)) {
+                try writeStringValue(writer, val, depth, options);
+            } else if (ptr.size == .slice) {
+                try writeSliceInner(ptr.child, writer, val, depth, options, depth > 0);
+            } else if (ptr.size == .one) {
+                try writeValue(ptr.child, writer, val.*, depth, options, false);
+            }
+        },
+        .array => |arr| {
+            try writeSliceInner(arr.child, writer, &val, depth, options, depth > 0);
+        },
+        .@"struct" => |s| {
+            try writeStruct(s, T, writer, val, depth, options);
+        },
+        .@"union" => {
+            if (T == Value) {
+                try writeValueUnion(writer, val, depth, options);
+            }
+        },
+        .@"enum" => {
+            // Value.null passes through anytype as the enum tag type.
+            if (T == std.meta.Tag(Value)) {
+                // Only the .null tag has no payload.
+                try writer.writeAll("null");
+            }
+        },
+        else => {},
+    }
+}
+
+fn writeFloat(comptime T: type, writer: anytype, val: T) !void {
+    const f: f64 = @floatCast(val);
+    if (std.math.isNan(f)) {
+        try writer.writeAll(".nan");
+        return;
+    }
+    if (std.math.isInf(f)) {
+        if (f < 0) {
+            try writer.writeAll("-.inf");
+        } else {
+            try writer.writeAll(".inf");
+        }
+        return;
+    }
+    const abs = @abs(f);
+    if (abs != 0 and (abs >= 1e6 or abs < 1e-3)) {
+        try writeScientific(writer, val);
+    } else {
+        // Format into buffer to check if we need to add .0.
+        var buf: [64]u8 = undefined;
+        const s = if (T == f32)
+            std.fmt.bufPrint(&buf, "{d}", .{val}) catch unreachable
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+        try writer.writeAll(s);
+        if (std.mem.indexOfScalar(u8, s, '.') == null) {
+            try writer.writeAll(".0");
+        }
+    }
+}
+
+fn writeScientific(writer: anytype, f: anytype) !void {
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{e}", .{f}) catch unreachable;
+    // Find the 'e' separator.
+    const e_pos = std.mem.indexOfScalar(u8, s, 'e') orelse {
+        try writer.writeAll(s);
+        return;
+    };
+    // Write mantissa.
+    try writer.writeAll(s[0..e_pos]);
+    try writer.writeByte('e');
+    // Parse exponent.
+    const exp_str = s[e_pos + 1 ..];
+    var negative = false;
+    var digits_start: usize = 0;
+    if (exp_str[0] == '-') {
+        negative = true;
+        digits_start = 1;
+    } else if (exp_str[0] == '+') {
+        digits_start = 1;
+    }
+    const exp_digits = exp_str[digits_start..];
+    if (negative) {
+        try writer.writeByte('-');
+    } else {
+        try writer.writeByte('+');
+    }
+    if (exp_digits.len < 2) {
+        try writer.writeByte('0');
+    }
+    try writer.writeAll(exp_digits);
+}
+
+fn isString(comptime T: type) bool {
+    return T == []const u8 or T == []u8;
+}
+
+fn writeStringValue(
+    writer: anytype,
+    val: []const u8,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    // Detect line ending type.
+    const line_end = detectLineEnding(val);
+
+    // Check for multiline (but not single newline or control-only strings).
+    if (hasNewlines(val, line_end) and val.len > 1) {
+        try writeBlockScalar(writer, val, depth, options, line_end);
+        return;
+    }
+
+    // Single-line string.
+    if (options.use_single_quote and std.mem.indexOfScalar(u8, val, '\\') != null) {
+        try writeSingleQuoted(writer, val);
+    } else if (needsDoubleQuoting(val, false)) {
+        if (options.use_single_quote and !hasControlChars(val)) {
+            try writeSingleQuoted(writer, val);
+        } else {
+            try writeDoubleQuoted(writer, val);
+        }
+    } else {
+        try writer.writeAll(val);
+    }
+}
+
+const LineEnding = enum { lf, cr, crlf };
+
+fn detectLineEnding(val: []const u8) LineEnding {
+    for (val, 0..) |c, i| {
+        if (c == '\r') {
+            if (i + 1 < val.len and val[i + 1] == '\n') return .crlf;
+            return .cr;
+        }
+        if (c == '\n') return .lf;
+    }
+    return .lf;
+}
+
+fn hasNewlines(val: []const u8, line_end: LineEnding) bool {
+    return switch (line_end) {
+        .lf => std.mem.indexOfScalar(u8, val, '\n') != null,
+        .cr => std.mem.indexOfScalar(u8, val, '\r') != null,
+        .crlf => std.mem.indexOf(u8, val, "\r\n") != null,
+    };
+}
+
+fn writeBlockScalar(
+    writer: anytype,
+    val: []const u8,
+    depth: u32,
+    options: EncodeOptions,
+    line_end: LineEnding,
+) !void {
+    const sep: []const u8 = switch (line_end) {
+        .lf => "\n",
+        .cr => "\r",
+        .crlf => "\r\n",
+    };
+    // Determine chomping indicator.
+    const ends_with_sep = std.mem.endsWith(u8, val, sep);
+    const content = if (ends_with_sep) val[0 .. val.len - sep.len] else val;
+    const ends_with_double = ends_with_sep and std.mem.endsWith(u8, content, sep);
+
+    // For keep mode, strip all trailing separators to get just the content lines.
+    var body = content;
+    if (ends_with_double) {
+        while (std.mem.endsWith(u8, body, sep)) {
+            body = body[0 .. body.len - sep.len];
+        }
+    }
+
+    try writer.writeByte('|');
+    if (ends_with_double) {
+        try writer.writeByte('+');
+    } else if (!ends_with_sep) {
+        try writer.writeByte('-');
+    }
+    var iter = std.mem.splitSequence(u8, body, sep);
+    while (iter.next()) |line| {
+        try writer.writeAll(sep);
+        try writeIndent(writer, depth + 1, options.indent);
+        try writer.writeAll(line);
+    }
+    if (ends_with_double) {
+        try writer.writeAll(sep);
+    }
+}
+
+fn needsDoubleQuoting(val: []const u8, flow: bool) bool {
+    if (encodeNeedsQuoting(val)) return true;
+    if (hasControlChars(val)) return true;
+    if (flow) {
+        for (val) |c| {
+            if (c == ',' or c == '}' or c == ']' or c == '\'' or c == '"') return true;
+        }
+    }
+    return false;
+}
+
+fn encodeNeedsQuoting(val: []const u8) bool {
+    return token.needsQuoting(val);
+}
+
+fn hasControlChars(val: []const u8) bool {
+    for (val) |c| {
+        if (c == '\t' or c == '\n' or c == '\r' or c < 0x20) return true;
+    }
+    return false;
+}
+
+fn writeDoubleQuoted(writer: anytype, val: []const u8) !void {
+    try writer.writeByte('"');
+    for (val) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\t' => try writer.writeAll("\\t"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writeSingleQuoted(writer: anytype, val: []const u8) !void {
+    try writer.writeByte('\'');
+    for (val) |c| {
+        if (c == '\'') {
+            try writer.writeAll("''");
+        } else {
+            try writer.writeByte(c);
+        }
+    }
+    try writer.writeByte('\'');
+}
+
+fn writeSlice(
+    comptime Child: type,
+    writer: anytype,
+    val: []const Child,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    writeSliceInner(Child, writer, val, depth, options, true) catch |err| return err;
+}
+
+fn writeSliceTop(
+    comptime Child: type,
+    writer: anytype,
+    val: []const Child,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    writeSliceInner(Child, writer, val, depth, options, false) catch |err| return err;
+}
+
+fn writeSliceInner(
+    comptime Child: type,
+    writer: anytype,
+    val: []const Child,
+    depth: u32,
+    options: EncodeOptions,
+    prefix_first: bool,
+) !void {
+    if (val.len == 0) {
+        try writer.writeAll("[]");
+        return;
+    }
+    for (val, 0..) |item, idx| {
+        if (idx > 0 or prefix_first) {
+            try writer.writeByte('\n');
+            try writeIndent(writer, depth, options.indent);
+        }
+        try writer.writeAll("- ");
+        try writeValue(Child, writer, item, depth + 1, options, false);
+    }
+}
+
+fn writeStruct(
+    comptime s: std.builtin.Type.Struct,
+    comptime T: type,
+    writer: anytype,
+    val: T,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    if (s.fields.len == 0) {
+        try writer.writeAll("{}");
+        return;
+    }
+    var first = true;
+    inline for (s.fields) |field| {
+        const field_val = @field(val, field.name);
+        const skip = options.omit_empty and isEmptyValue(field.type, field_val);
+        if (!skip) {
+            if (!first) {
+                try writer.writeByte('\n');
+                try writeIndent(writer, depth, options.indent);
+            }
+            first = false;
+            try writer.writeAll(field.name);
+            try writeFieldValue(field.type, writer, field_val, depth, options);
+        }
+    }
+}
+
+fn writeFieldValue(
+    comptime T: type,
+    writer: anytype,
+    val: T,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    const ti = @typeInfo(T);
+    if (ti == .@"struct") {
+        const s = ti.@"struct";
+        if (s.fields.len == 0) {
+            try writer.writeAll(": {}");
+        } else {
+            try writer.writeByte(':');
+            try writer.writeByte('\n');
+            try writeIndent(writer, depth + 1, options.indent);
+            try writeStruct(s, T, writer, val, depth + 1, options);
+        }
+        return;
+    }
+    if (ti == .array) {
+        const arr = ti.array;
+        if (arr.len == 0) {
+            try writer.writeAll(": []");
+        } else {
+            try writer.writeByte(':');
+            const seq_depth = if (options.indent_sequence) depth + 1 else depth;
+            try writeSlice(arr.child, writer, &val, seq_depth, options);
+        }
+        return;
+    }
+    if (ti == .optional) {
+        if (val) |v| {
+            try writeFieldValue(@TypeOf(v), writer, v, depth, options);
+        } else {
+            try writer.writeAll(": null");
+        }
+        return;
+    }
+    if (ti == .pointer) {
+        const ptr = ti.pointer;
+        if (comptime isString(T)) {
+            const line_end = detectLineEnding(val);
+            if (hasNewlines(val, line_end)) {
+                try writer.writeAll(": ");
+                try writeBlockScalar(writer, val, depth, options, line_end);
+                return;
+            }
+            try writer.writeAll(": ");
+            try writeStringValue(writer, val, depth + 1, options);
+            return;
+        }
+        if (ptr.size == .slice) {
+            if (val.len == 0) {
+                try writer.writeAll(": []");
+            } else {
+                try writer.writeByte(':');
+                const seq_depth = if (options.indent_sequence) depth + 1 else depth;
+                try writeSlice(ptr.child, writer, val, seq_depth, options);
+            }
+            return;
+        }
+    }
+    if (ti == .@"union" and T == Value) {
+        switch (val) {
+            .mapping => |m| {
+                if (m.keys.len == 0) {
+                    try writer.writeAll(": {}");
+                } else {
+                    try writer.writeByte(':');
+                    try writer.writeByte('\n');
+                    try writeIndent(writer, depth + 1, options.indent);
+                    try writeValueUnion(writer, val, depth + 1, options);
+                }
+                return;
+            },
+            .sequence => |s| {
+                if (s.len == 0) {
+                    try writer.writeAll(": []");
+                } else {
+                    try writer.writeByte(':');
+                    try writeValueUnion(writer, val, depth, options);
+                }
+                return;
+            },
+            else => {},
+        }
+    }
+    try writer.writeAll(": ");
+    try writeValue(T, writer, val, depth + 1, options, false);
+}
+
+fn isEmptyValue(comptime T: type, val: T) bool {
+    const ti = @typeInfo(T);
+    switch (ti) {
+        .optional => return val == null,
+        .bool => return !val,
+        .int, .comptime_int => return val == 0,
+        .float, .comptime_float => return val == 0.0,
+        .pointer => |ptr| {
+            if (comptime isString(T)) return val.len == 0;
+            if (ptr.size == .slice) return val.len == 0;
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn writeValueUnion(
+    writer: anytype,
+    val: Value,
+    depth: u32,
+    options: EncodeOptions,
+) !void {
+    switch (val) {
+        .null => try writer.writeAll("null"),
+        .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
+        .integer => |i| try writer.print("{d}", .{i}),
+        .float => |f| try writeFloat(f64, writer, f),
+        .string => |s| try writeStringValue(writer, s, depth, options),
+        .sequence => |seq| {
+            if (seq.len == 0) {
+                try writer.writeAll("[]");
+            } else {
+                for (seq, 0..) |item, idx| {
+                    if (idx > 0 or depth > 0) {
+                        try writer.writeByte('\n');
+                        try writeIndent(writer, depth, options.indent);
+                    }
+                    switch (item) {
+                        .sequence => {
+                            try writer.writeByte('-');
+                            try writeValueUnion(writer, item, depth + 1, options);
+                        },
+                        else => {
+                            try writer.writeAll("- ");
+                            try writeValueUnion(writer, item, depth + 1, options);
+                        },
+                    }
+                }
+            }
+        },
+        .mapping => |m| {
+            if (m.keys.len == 0) {
+                try writer.writeAll("{}");
+            } else {
+                for (m.keys, m.values, 0..) |key, v, idx| {
+                    if (idx > 0) {
+                        try writer.writeByte('\n');
+                        try writeIndent(writer, depth, options.indent);
+                    }
+                    try writeValueUnion(writer, key, depth, options);
+                    switch (v) {
+                        .mapping => |vm| {
+                            if (vm.keys.len == 0) {
+                                try writer.writeAll(": {}");
+                            } else {
+                                try writer.writeByte(':');
+                                try writer.writeByte('\n');
+                                try writeIndent(writer, depth + 1, options.indent);
+                                try writeValueUnion(writer, v, depth + 1, options);
+                            }
+                        },
+                        .sequence => |vs| {
+                            if (vs.len == 0) {
+                                try writer.writeAll(": []");
+                            } else {
+                                try writer.writeByte(':');
+                                for (vs, 0..) |si, si_idx| {
+                                    if (si_idx > 0 or depth > 0) {
+                                        try writer.writeByte('\n');
+                                        try writeIndent(writer, depth, options.indent);
+                                    } else {
+                                        try writer.writeByte('\n');
+                                    }
+                                    try writer.writeAll("- ");
+                                    try writeValueUnion(writer, si, depth + 1, options);
+                                }
+                            }
+                        },
+                        else => {
+                            try writer.writeAll(": ");
+                            try writeValueUnion(writer, v, depth + 1, options);
+                        },
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn writeFlowValue(
+    comptime T: type,
+    writer: anytype,
+    val: T,
+    options: EncodeOptions,
+) !void {
+    const ti = @typeInfo(T);
+    switch (ti) {
+        .bool => try writer.writeAll(if (val) "true" else "false"),
+        .int, .comptime_int => try writer.print("{d}", .{val}),
+        .float, .comptime_float => try writeFloat(T, writer, val),
+        .optional => {
+            if (val) |v| {
+                try writeFlowValue(@TypeOf(v), writer, v, options);
+            } else {
+                try writer.writeAll("null");
+            }
+        },
+        .pointer => |ptr| {
+            if (comptime isString(T)) {
+                try writeFlowString(writer, val);
+            } else if (ptr.size == .slice) {
+                try writeFlowSlice(ptr.child, writer, val, options);
+            }
+        },
+        .array => |arr| {
+            try writeFlowSlice(arr.child, writer, &val, options);
+        },
+        .@"struct" => |s| {
+            try writeFlowStruct(s, T, writer, val, options);
+        },
+        .@"union" => {
+            if (T == Value) {
+                try writeFlowValueUnion(writer, val, options);
+            }
+        },
+        .@"enum" => {
+            if (T == std.meta.Tag(Value)) {
+                try writer.writeAll("null");
+            }
+        },
+        else => {},
+    }
+}
+
+fn writeFlowString(writer: anytype, val: []const u8) !void {
+    if (needsDoubleQuoting(val, true)) {
+        try writeDoubleQuoted(writer, val);
+    } else {
+        try writer.writeAll(val);
+    }
+}
+
+fn writeFlowSlice(
+    comptime Child: type,
+    writer: anytype,
+    val: []const Child,
+    options: EncodeOptions,
+) !void {
+    if (val.len == 0) {
+        try writer.writeAll("[]");
+        return;
+    }
+    try writer.writeByte('[');
+    for (val, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try writeFlowValue(Child, writer, item, options);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeFlowStruct(
+    comptime s: std.builtin.Type.Struct,
+    comptime T: type,
+    writer: anytype,
+    val: T,
+    options: EncodeOptions,
+) !void {
+    if (s.fields.len == 0) {
+        try writer.writeAll("{}");
+        return;
+    }
+    try writer.writeByte('{');
+    var first = true;
+    inline for (s.fields) |field| {
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        try writer.writeAll(field.name);
+        try writer.writeAll(": ");
+        try writeFlowValue(field.type, writer, @field(val, field.name), options);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeFlowValueUnion(writer: anytype, val: Value, options: EncodeOptions) !void {
+    switch (val) {
+        .null => try writer.writeAll("null"),
+        .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
+        .integer => |i| try writer.print("{d}", .{i}),
+        .float => |f| try writeFloat(f64, writer, f),
+        .string => |s| try writeFlowString(writer, s),
+        .sequence => |seq| {
+            if (seq.len == 0) {
+                try writer.writeAll("[]");
+                return;
+            }
+            try writer.writeByte('[');
+            for (seq, 0..) |item, idx| {
+                if (idx > 0) try writer.writeAll(", ");
+                try writeFlowValueUnion(writer, item, options);
+            }
+            try writer.writeByte(']');
+        },
+        .mapping => |m| {
+            if (m.keys.len == 0) {
+                try writer.writeAll("{}");
+                return;
+            }
+            try writer.writeByte('{');
+            for (m.keys, m.values, 0..) |key, v, idx| {
+                if (idx > 0) try writer.writeAll(", ");
+                try writeFlowValueUnion(writer, key, options);
+                try writer.writeAll(": ");
+                try writeFlowValueUnion(writer, v, options);
+            }
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn testEncode(val: anytype) ![]u8 {
