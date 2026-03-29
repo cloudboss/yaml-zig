@@ -174,6 +174,7 @@ test "encode struct with string slice" {
         \\v:
         \\- A
         \\- B
+        \\
     ,
         r,
     );
@@ -187,6 +188,7 @@ test "encode struct with string array" {
         \\v:
         \\- A
         \\- B
+        \\
     ,
         r,
     );
@@ -220,6 +222,7 @@ test "encode struct with multiline keep" {
         \\hello: |
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -233,6 +236,7 @@ test "encode struct with multiline strip" {
         \\hello: |-
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -262,6 +266,7 @@ test "encode nested struct with multiline" {
         \\  hello: |
         \\    hello
         \\    world
+        \\
     ,
         r,
     );
@@ -410,6 +415,7 @@ test "encode struct with sub mapping" {
         \\d: 4
         \\sub:
         \\  e: 5
+        \\
     ,
         r,
     );
@@ -422,6 +428,7 @@ test "encode struct with empty slice" {
     try testing.expectEqualStrings(
         \\a: 1
         \\b: []
+        \\
     ,
         r,
     );
@@ -579,6 +586,7 @@ test "encode simple struct" {
     try testing.expectEqualStrings(
         \\a: 1
         \\b: hello
+        \\
     ,
         r,
     );
@@ -592,6 +600,7 @@ test "encode nested struct" {
     try testing.expectEqualStrings(
         \\a:
         \\  b: c
+        \\
     ,
         r,
     );
@@ -607,6 +616,7 @@ test "encode struct with optional null" {
     try testing.expectEqualStrings(
         \\a: 1
         \\b: null
+        \\
     ,
         r,
     );
@@ -619,6 +629,7 @@ test "encode slice of strings" {
         \\- A
         \\- B
         \\- C
+        \\
     ,
         r,
     );
@@ -631,6 +642,7 @@ test "encode slice of integers" {
         \\- 1
         \\- 2
         \\- 3
+        \\
     ,
         r,
     );
@@ -652,6 +664,7 @@ test "encode multiline string literal" {
         \\|
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -667,6 +680,7 @@ test "encode multiline string literal strip" {
         \\|-
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -706,6 +720,7 @@ test "encode Value sequence" {
     try testing.expectEqualStrings(
         \\- A
         \\- B
+        \\
     ,
         r,
     );
@@ -731,6 +746,7 @@ test "encode Value mapping" {
     try testing.expectEqualStrings(
         \\a: 1
         \\b: 2
+        \\
     ,
         r,
     );
@@ -758,6 +774,7 @@ test "encode Value nested mapping" {
     try testing.expectEqualStrings(
         \\a:
         \\  b: c
+        \\
     ,
         r,
     );
@@ -789,6 +806,7 @@ test "encode Value mapping with two entries" {
         \\a:
         \\  b: c
         \\  d: e
+        \\
     ,
         r,
     );
@@ -830,6 +848,7 @@ test "encode Value with mixed sequence" {
         \\- B:
         \\  - 2
         \\  - 3
+        \\
     ,
         r,
     );
@@ -986,6 +1005,7 @@ test "encode non-flow comma in string" {
         \\- b
         \\- c,d
         \\- e
+        \\
     ,
         r,
     );
@@ -1130,6 +1150,7 @@ test "encode array of ints" {
         \\- 10
         \\- 20
         \\- 30
+        \\
     ,
         r,
     );
@@ -1142,6 +1163,7 @@ test "encode array of bools" {
         \\- true
         \\- false
         \\- true
+        \\
     ,
         r,
     );
@@ -1160,6 +1182,7 @@ test "encode struct two string fields" {
     try testing.expectEqualStrings(
         \\a: b
         \\c: d
+        \\
     ,
         r,
     );
@@ -1175,6 +1198,7 @@ test "encode deeply nested struct" {
         \\b:
         \\  c:
         \\    d: 42
+        \\
     ,
         r,
     );
@@ -1192,6 +1216,7 @@ test "encode struct with slice field" {
         \\items:
         \\- 1
         \\- 2
+        \\
     ,
         r,
     );
@@ -1207,6 +1232,7 @@ test "encode struct with nested slice" {
         \\  tags:
         \\  - a
         \\  - b
+        \\
     ,
         r,
     );
@@ -1219,6 +1245,7 @@ test "encode struct with bool fields" {
     try testing.expectEqualStrings(
         \\enabled: true
         \\debug: false
+        \\
     ,
         r,
     );
@@ -1231,6 +1258,7 @@ test "encode struct with float fields" {
     try testing.expectEqualStrings(
         \\x: 1.5
         \\y: -2.5
+        \\
     ,
         r,
     );
@@ -1243,6 +1271,7 @@ test "encode struct with optional present" {
     try testing.expectEqualStrings(
         \\a: 1
         \\b: 99
+        \\
     ,
         r,
     );
@@ -1255,6 +1284,7 @@ test "encode struct with multiple optionals" {
     try testing.expectEqualStrings(
         \\a: null
         \\b: null
+        \\
     ,
         r,
     );
@@ -1335,6 +1365,7 @@ test "encode Value sequence of ints" {
         \\- 1
         \\- 2
         \\- 3
+        \\
     ,
         r,
     );
@@ -1354,6 +1385,7 @@ test "encode Value sequence of mixed types" {
         \\- 42
         \\- true
         \\- null
+        \\
     ,
         r,
     );
@@ -1375,6 +1407,7 @@ test "encode Value nested sequence" {
         \\-
         \\  - 1
         \\  - 2
+        \\
     ,
         r,
     );
@@ -1397,6 +1430,7 @@ test "encode Value mapping with sequence value" {
         \\items:
         \\- 1
         \\- 2
+        \\
     ,
         r,
     );
@@ -1497,6 +1531,7 @@ test "encode multiline bare string keep" {
         \\|
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -1509,6 +1544,7 @@ test "encode multiline bare string strip" {
         \\|-
         \\  hello
         \\  world
+        \\
     ,
         r,
     );
@@ -1566,6 +1602,7 @@ test "encode slice of structs" {
     try testing.expectEqualStrings(
         \\- name: a
         \\- name: b
+        \\
     ,
         r,
     );
@@ -1580,6 +1617,7 @@ test "encode struct with slice of structs" {
         \\items:
         \\- id: 1
         \\- id: 2
+        \\
     ,
         r,
     );
@@ -1673,6 +1711,7 @@ test "encode struct three fields" {
         \\a: 1
         \\b: hello
         \\c: true
+        \\
     ,
         r,
     );
@@ -1787,6 +1826,7 @@ test "encode slice of bools" {
     try testing.expectEqualStrings(
         \\- true
         \\- false
+        \\
     ,
         r,
     );
@@ -1798,6 +1838,7 @@ test "encode slice of floats" {
     try testing.expectEqualStrings(
         \\- 1.1
         \\- 2.2
+        \\
     ,
         r,
     );
@@ -1831,6 +1872,7 @@ test "encode large struct" {
         \\c: 3
         \\d: 4
         \\e: 5
+        \\
     ,
         r,
     );
@@ -1844,6 +1886,7 @@ test "encode struct with nested optional" {
     try testing.expectEqualStrings(
         \\inner:
         \\  x: 5
+        \\
     ,
         r,
     );
@@ -1909,6 +1952,7 @@ test "encode struct with array field" {
         \\- 1
         \\- 2
         \\- 3
+        \\
     ,
         r,
     );
@@ -1922,6 +1966,7 @@ test "encode struct with nested empty slice" {
     try testing.expectEqualStrings(
         \\data:
         \\  items: []
+        \\
     ,
         r,
     );
@@ -1940,7 +1985,8 @@ test "encode Value mapping with bool values" {
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\x: true
-        \\y: false
+        \\"y": false
+        \\
     ,
         r,
     );
@@ -1970,6 +2016,7 @@ test "encode struct many string fields" {
         \\first: a
         \\second: b
         \\third: c
+        \\
     ,
         r,
     );
