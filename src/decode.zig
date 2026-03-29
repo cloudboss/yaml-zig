@@ -2,8 +2,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-const Node = @import("ast.zig").Node;
+const ast = @import("ast.zig");
+const Node = ast.Node;
+const parser_mod = @import("parser.zig");
+const scanner_mod = @import("scanner.zig");
+const token = @import("token.zig");
 const Value = @import("value.zig").Value;
+const yaml = @import("yaml.zig");
 
 pub const DecodeOptions = struct {
     disallow_unknown_fields: bool = false,
@@ -16,17 +21,1509 @@ pub fn decode(
     source: []const u8,
     options: DecodeOptions,
 ) !T {
+    // TODO: decoded string values reference scanner-allocated strings
+    // (escape-processed quotes, assembled block scalars) in the parse
+    // arena. Until decode returns a managed result type with deinit,
+    // the arena cannot be freed without dangling pointers.
     _ = allocator;
-    _ = source;
-    _ = options;
-    return error.Unimplemented;
+    const pa = std.heap.page_allocator;
+
+    const preprocessed = try preprocessYaml(pa, source);
+    const root = try parseSource(pa, preprocessed);
+    const node_val = switch (root) {
+        .document => |d| blk: {
+            if (d.body) |b| break :blk b.*;
+            return decodeNull(T, pa);
+        },
+        else => root,
+    };
+    var anchors = AnchorMap.init(pa);
+    return decodeNodeInternal(T, pa, node_val, options, &anchors);
 }
 
-pub fn decodeNode(comptime T: type, allocator: Allocator, node: Node, options: DecodeOptions) !T {
+fn scanAndParse(pa: Allocator, source: []const u8) !Node {
+    var s = scanner_mod.Scanner.init(pa, source);
+    const tokens = try s.scan();
+    for (tokens, 0..) |*t, i| {
+        if (i > 0) t.prev = &tokens[i - 1];
+        if (i + 1 < tokens.len) t.next = &tokens[i + 1];
+    }
+    var p = parser_mod.Parser.init(pa);
+    return p.parse(tokens);
+}
+
+fn parseSource(pa: Allocator, source: []const u8) !Node {
+    return scanAndParse(pa, source) catch |e| {
+        // Duplicate keys: retry after removing earlier duplicates
+        // to implement "last wins" semantics.
+        if (e == error.DuplicateKey) {
+            const deduped = try deduplicateKeys(pa, source);
+            return scanAndParse(pa, deduped);
+        }
+        return e;
+    };
+}
+
+fn preprocessYaml(allocator: Allocator, source: []const u8) ![]const u8 {
+    // Fix bare sequence entries (- followed by newline) that confuse the parser.
+    // Only insert explicit null when the next non-empty line is at the same or lower
+    // indentation, meaning it's NOT a continuation/value of the dash entry.
+    var result = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < source.len) {
+        if (source[i] == '-') {
+            const at_line_start = (i == 0) or
+                (i > 0 and (source[i - 1] == '\n' or source[i - 1] == '\r'));
+            const after_ws = i > 0 and source[i - 1] == ' ';
+            if (at_line_start or after_ws) {
+                if (i + 1 >= source.len) {
+                    try result.append(allocator, '-');
+                    i += 1;
+                } else if (source[i + 1] == '\n' or source[i + 1] == '\r') {
+                    // Compute the dash's indentation level
+                    const dash_indent = computeIndent(source, i);
+                    // Find the next non-empty line's indentation
+                    const next_indent = findNextLineIndent(source, i + 1);
+                    if (next_indent != null and next_indent.? <= dash_indent) {
+                        // Next line is at same or lower indent: bare null entry
+                        try result.appendSlice(allocator, "- ~");
+                        i += 1;
+                    } else {
+                        // Next line is more indented: it's the dash's value
+                        try result.append(allocator, source[i]);
+                        i += 1;
+                    }
+                } else {
+                    try result.append(allocator, source[i]);
+                    i += 1;
+                }
+            } else {
+                try result.append(allocator, source[i]);
+                i += 1;
+            }
+        } else if (i + 8 <= source.len and
+            std.mem.eql(u8, source[i .. i + 8], "!!merge "))
+        {
+            // Strip redundant !!merge tag (<<: already indicates merge)
+            i += 8;
+        } else {
+            try result.append(allocator, source[i]);
+            i += 1;
+        }
+    }
+    return result.items;
+}
+
+fn computeIndent(source: []const u8, pos: usize) usize {
+    // Find the start of the line containing pos and count leading spaces
+    var line_start = pos;
+    while (line_start > 0 and source[line_start - 1] != '\n' and source[line_start - 1] != '\r') {
+        line_start -= 1;
+    }
+    var indent: usize = 0;
+    var j = line_start;
+    while (j < source.len and source[j] == ' ') {
+        indent += 1;
+        j += 1;
+    }
+    return indent;
+}
+
+fn findNextLineIndent(source: []const u8, pos: usize) ?usize {
+    // Skip to the next line
+    var j = pos;
+    while (j < source.len and (source[j] == '\n' or source[j] == '\r')) {
+        j += 1;
+    }
+    if (j >= source.len) return null;
+    // Skip blank lines
+    while (j < source.len) {
+        // Count indent of this line
+        var indent: usize = 0;
+        while (j + indent < source.len and source[j + indent] == ' ') {
+            indent += 1;
+        }
+        // Check if line is blank
+        if (j + indent >= source.len or source[j + indent] == '\n' or source[j + indent] == '\r') {
+            j = j + indent;
+            while (j < source.len and (source[j] == '\n' or source[j] == '\r')) j += 1;
+            continue;
+        }
+        return indent;
+    }
+    return null;
+}
+
+fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
+    // Simple line-based deduplication for top-level mapping keys.
+    // Keeps the LAST occurrence of each key.
+    var lines = std.ArrayListUnmanaged([]const u8){};
+    var keys = std.ArrayListUnmanaged([]const u8){};
+    var start: usize = 0;
+    for (source, 0..) |c, idx| {
+        if (c == '\n' or idx == source.len - 1) {
+            const end = if (c == '\n') idx else idx + 1;
+            const line = source[start..end];
+            try lines.append(allocator, line);
+            // Extract key from lines that start at column 0 with "key:"
+            if (line.len > 0 and line[0] != ' ' and line[0] != '\t' and
+                line[0] != '-' and line[0] != '#')
+            {
+                if (std.mem.indexOf(u8, line, ":")) |colon| {
+                    try keys.append(allocator, line[0..colon]);
+                } else {
+                    try keys.append(allocator, "");
+                }
+            } else {
+                try keys.append(allocator, "");
+            }
+            start = if (c == '\n') idx + 1 else end;
+        }
+    }
+    // Find duplicate keys and mark earlier occurrences for removal
+    var keep = try allocator.alloc(bool, lines.items.len);
+    for (keep) |*k| k.* = true;
+    for (keys.items, 0..) |key, idx| {
+        if (key.len == 0) continue;
+        // Check if a later line has the same key
+        for (keys.items[idx + 1 ..], idx + 1..) |later_key, later_idx| {
+            if (std.mem.eql(u8, key, later_key)) {
+                keep[idx] = false;
+                // Also remove continuation lines (indented) after the removed key
+                var j = idx + 1;
+                while (j < lines.items.len and j < later_idx) {
+                    if (lines.items[j].len > 0 and
+                        (lines.items[j][0] == ' ' or lines.items[j][0] == '\t'))
+                    {
+                        keep[j] = false;
+                    } else {
+                        break;
+                    }
+                    j += 1;
+                }
+                break;
+            }
+        }
+    }
+    // Build result
+    var result = std.ArrayListUnmanaged(u8){};
+    for (lines.items, 0..) |line, idx| {
+        if (keep[idx]) {
+            try result.appendSlice(allocator, line);
+            if (idx + 1 < lines.items.len) try result.append(allocator, '\n');
+        }
+    }
+    return result.items;
+}
+
+pub fn decodeNode(
+    comptime T: type,
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+) !T {
+    var anchors = AnchorMap.init(allocator);
+    defer anchors.deinit();
+    return decodeNodeInternal(T, allocator, node, options, &anchors);
+}
+
+const AnchorMap = struct {
+    map: std.StringHashMap(*const Node),
+    active: std.StringHashMap(void),
+
+    fn init(allocator: Allocator) AnchorMap {
+        return .{
+            .map = std.StringHashMap(*const Node).init(allocator),
+            .active = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *AnchorMap) void {
+        self.map.deinit();
+        self.active.deinit();
+    }
+
+    fn put(self: *AnchorMap, name: []const u8, node: *const Node) void {
+        self.map.put(name, node) catch {};
+    }
+
+    fn get(self: *AnchorMap, name: []const u8) ?*const Node {
+        return self.map.get(name);
+    }
+
+    fn isActive(self: *AnchorMap, name: []const u8) bool {
+        return self.active.contains(name);
+    }
+
+    fn markActive(self: *AnchorMap, name: []const u8) void {
+        self.active.put(name, {}) catch {};
+    }
+
+    fn unmarkActive(self: *AnchorMap, name: []const u8) void {
+        _ = self.active.remove(name);
+    }
+};
+
+fn decodeNull(comptime T: type, allocator: Allocator) !T {
     _ = allocator;
-    _ = node;
-    _ = options;
-    return error.Unimplemented;
+    const info = @typeInfo(T);
+    if (info == .optional) return null;
+    if (T == Value) return .null;
+    if (comptime isStringType(T)) return "";
+    return error.TypeMismatch;
+}
+
+fn isStringType(comptime T: type) bool {
+    return T == []const u8 or T == []u8;
+}
+
+fn decodeNodeInternal(
+    comptime T: type,
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !T {
+    // Unwrap document nodes
+    if (node == .document) {
+        if (node.document.body) |body| {
+            return decodeNodeInternal(T, allocator, body.*, options, anchors);
+        }
+        return decodeNull(T, allocator);
+    }
+
+    // Handle mapping_value nodes (single key-value pair from parser)
+    if (node == .mapping_value) {
+        return decodeMappingValueAsMapping(T, allocator, node.mapping_value, options, anchors);
+    }
+
+    // Handle anchor nodes: register, then decode inner value
+    if (node == .anchor) {
+        const anch = node.anchor;
+        if (anch.value) |inner| {
+            anchors.put(anch.name, inner);
+            anchors.markActive(anch.name);
+            defer anchors.unmarkActive(anch.name);
+            return decodeNodeInternal(T, allocator, inner.*, options, anchors);
+        }
+        return decodeNull(T, allocator);
+    }
+
+    // Handle alias nodes
+    if (node == .alias) {
+        const name = node.alias.name;
+        if (anchors.isActive(name)) return decodeNull(T, allocator);
+        if (anchors.get(name)) |target| {
+            anchors.markActive(name);
+            defer anchors.unmarkActive(name);
+            return decodeNodeInternal(T, allocator, target.*, options, anchors);
+        }
+        return error.Unimplemented;
+    }
+
+    // Handle tag nodes - inline to avoid recursive error set issues
+    if (node == .tag) {
+        const tag_str = node.tag.tag;
+        const tag_inner = node.tag.value orelse {
+            return decodeNull(T, allocator);
+        };
+
+        if (std.mem.eql(u8, tag_str, "!!binary")) {
+            if (comptime isStringType(T)) {
+                const encoded = getNodeStringValue(tag_inner.*);
+                return base64Decode(allocator, encoded);
+            }
+            if (T == Value) {
+                const encoded = getNodeStringValue(tag_inner.*);
+                const decoded = try base64Decode(allocator, encoded);
+                return Value{ .string = decoded };
+            }
+        }
+
+        if (std.mem.eql(u8, tag_str, "!!null")) {
+            const ti = @typeInfo(T);
+            if (ti == .optional) return null;
+            if (T == Value) return .null;
+            return decodeNull(T, allocator);
+        }
+
+        if (std.mem.eql(u8, tag_str, "!!bool")) {
+            if (@typeInfo(T) == .bool or T == bool) {
+                return decodeTaggedBool(tag_inner.*);
+            }
+            if (T == Value) {
+                return Value{ .boolean = try decodeTaggedBool(tag_inner.*) };
+            }
+        }
+
+        if (std.mem.eql(u8, tag_str, "!!float")) {
+            if (@typeInfo(T) == .float) {
+                return decodeTaggedFloat(T, tag_inner.*);
+            }
+            if (T == Value) {
+                const f = try decodeTaggedFloat(f64, tag_inner.*);
+                return Value{ .float = f };
+            }
+        }
+
+        if (std.mem.eql(u8, tag_str, "!!str")) {
+            if (comptime isStringType(T)) {
+                return getNodeStringValue(tag_inner.*);
+            }
+            if (T == Value) {
+                return Value{ .string = getNodeStringValue(tag_inner.*) };
+            }
+        }
+
+        // For !!map, !!merge, and unknown tags, decode the inner value
+        return decodeNodeInternal(T, allocator, tag_inner.*, options, anchors);
+    }
+
+    // Check for yamlParse custom method
+    if (comptime hasYamlParse(T)) {
+        return T.yamlParse(allocator, node);
+    }
+
+    const info = @typeInfo(T);
+
+    // Handle optional types
+    if (info == .optional) {
+        if (node == .null_value) return null;
+        const Child = info.optional.child;
+        return @as(T, try decodeNodeInternal(Child, allocator, node, options, anchors));
+    }
+
+    // Handle Value union (untyped decode)
+    if (T == Value) {
+        return decodeToValue(allocator, node, options, anchors);
+    }
+
+    // Handle string types
+    if (comptime isStringType(T)) {
+        return decodeToString(allocator, node);
+    }
+
+    // Handle integer types
+    if (info == .int) {
+        return decodeToInt(T, node);
+    }
+
+    // Handle float types
+    if (info == .float) {
+        return decodeToFloat(T, node);
+    }
+
+    // Handle bool
+    if (info == .bool) {
+        return decodeToBool(node);
+    }
+
+    // Handle structs
+    if (info == .@"struct") {
+        return decodeToStruct(T, allocator, node, options, anchors);
+    }
+
+    // Handle slices
+    if (info == .pointer and info.pointer.size == .slice) {
+        return decodeToSlice(T, allocator, node, options, anchors);
+    }
+
+    // Handle arrays
+    if (info == .array) {
+        return decodeToArray(T, allocator, node, options, anchors);
+    }
+
+    return error.TypeMismatch;
+}
+
+fn decodeMappingValueAsMapping(
+    comptime T: type,
+    allocator: Allocator,
+    mv: ast.MappingValueNode,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !T {
+    const info = @typeInfo(T);
+
+    // For structs, decode the single key-value pair
+    if (info == .@"struct" and T != Value) {
+        if (comptime hasYamlParse(T)) {
+            // Wrap in mapping node for yamlParse
+            const node = Node{ .mapping_value = mv };
+            return T.yamlParse(allocator, node);
+        }
+
+        var result: T = undefined;
+        const fields = std.meta.fields(T);
+        inline for (fields) |field| {
+            if (field.defaultValue()) |dv| {
+                @field(result, field.name) = dv;
+            }
+        }
+        var fields_set: [fields.len]bool = [_]bool{false} ** fields.len;
+
+        if (mv.key) |key_node| {
+            if (key_node.* == .merge_key or isMergeKeyTag(key_node.*)) {
+                if (mv.value) |vn| {
+                    try applyMergeToStruct(
+                        T,
+                        &result,
+                        &fields_set,
+                        allocator,
+                        vn,
+                        options,
+                        anchors,
+                    );
+                }
+            } else {
+                const key_str = getKeyString(key_node.*, anchors);
+                inline for (fields, 0..) |field, idx| {
+                    if (std.mem.eql(u8, key_str, field.name)) {
+                        if (mv.value) |vn| {
+                            @field(result, field.name) =
+                                try decodeNodeInternal(
+                                    field.type,
+                                    allocator,
+                                    vn.*,
+                                    options,
+                                    anchors,
+                                );
+                        } else {
+                            if (@typeInfo(field.type) == .optional) {
+                                @field(result, field.name) = null;
+                            } else if (comptime isStringType(field.type)) {
+                                @field(result, field.name) = "";
+                            }
+                        }
+                        fields_set[idx] = true;
+                    }
+                }
+                if (options.disallow_unknown_fields) {
+                    var found = false;
+                    inline for (fields) |field| {
+                        if (std.mem.eql(u8, key_str, field.name)) {
+                            found = true;
+                        }
+                    }
+                    if (!found) return error.UnknownField;
+                }
+            }
+        }
+        return result;
+    }
+
+    // For Value, create a mapping with one entry
+    if (T == Value) {
+        return decodeMappingValueToValue(allocator, mv, options, anchors);
+    }
+
+    // For optional
+    if (info == .optional) {
+        const Child = info.optional.child;
+        return @as(T, try decodeMappingValueAsMapping(Child, allocator, mv, options, anchors));
+    }
+
+    return error.TypeMismatch;
+}
+
+fn decodeMappingValueToValue(
+    allocator: Allocator,
+    mv: ast.MappingValueNode,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) DecodeErrorSet!Value {
+    // Handle merge key in mapping_value
+    if (mv.key) |k| {
+        if (k.* == .merge_key or isMergeKeyTag(k.*)) {
+            var keys_list = std.ArrayListUnmanaged(Value){};
+            var vals_list = std.ArrayListUnmanaged(Value){};
+            defer keys_list.deinit(allocator);
+            defer vals_list.deinit(allocator);
+            if (mv.value) |vn| {
+                try applyMergeToValueMap(allocator, &keys_list, &vals_list, vn, options, anchors);
+            }
+            const keys = try allocator.alloc(Value, keys_list.items.len);
+            const vals = try allocator.alloc(Value, vals_list.items.len);
+            @memcpy(keys, keys_list.items);
+            @memcpy(vals, vals_list.items);
+            return Value{ .mapping = .{ .keys = keys, .values = vals } };
+        }
+    }
+    const keys = try allocator.alloc(Value, 1);
+    const vals = try allocator.alloc(Value, 1);
+    keys[0] = if (mv.key) |k|
+        try decodeToValue(allocator, k.*, options, anchors)
+    else
+        .null;
+    vals[0] = if (mv.value) |v|
+        try decodeToValue(allocator, v.*, options, anchors)
+    else
+        .null;
+    return Value{ .mapping = .{ .keys = keys, .values = vals } };
+}
+
+fn hasYamlParse(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlParse");
+}
+
+fn decodeTaggedBool(node: Node) !bool {
+    const str = getNodeStringValue(node);
+    if (std.mem.eql(u8, str, "true") or std.mem.eql(u8, str, "True") or
+        std.mem.eql(u8, str, "TRUE"))
+        return true;
+    if (std.mem.eql(u8, str, "false") or std.mem.eql(u8, str, "False") or
+        std.mem.eql(u8, str, "FALSE"))
+        return false;
+    if (std.mem.eql(u8, str, "yes") or std.mem.eql(u8, str, "Yes") or
+        std.mem.eql(u8, str, "YES"))
+        return true;
+    if (std.mem.eql(u8, str, "no") or std.mem.eql(u8, str, "No") or
+        std.mem.eql(u8, str, "NO"))
+        return false;
+    if (std.mem.eql(u8, str, "on") or std.mem.eql(u8, str, "On") or
+        std.mem.eql(u8, str, "ON"))
+        return true;
+    if (std.mem.eql(u8, str, "off") or std.mem.eql(u8, str, "Off") or
+        std.mem.eql(u8, str, "OFF"))
+        return false;
+    if (node == .boolean) return node.boolean.value;
+    return error.TypeMismatch;
+}
+
+fn decodeTaggedFloat(comptime T: type, node: Node) !T {
+    return switch (node) {
+        .float_value => |f| @floatCast(f.value),
+        .integer => |i| @floatFromInt(i.value),
+        .string => |s| parseFloatFromString(T, s.value),
+        .literal => |l| parseFloatFromString(T, l.value),
+        else => error.TypeMismatch,
+    };
+}
+
+fn parseFloatFromString(comptime T: type, str: []const u8) !T {
+    // Strip underscores
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    for (str) |c| {
+        if (c == '_') continue;
+        if (len >= buf.len) return error.TypeMismatch;
+        buf[len] = c;
+        len += 1;
+    }
+    const clean = buf[0..len];
+    const f = std.fmt.parseFloat(f64, clean) catch return error.TypeMismatch;
+    return @floatCast(f);
+}
+
+fn base64Decode(allocator: Allocator, encoded: []const u8) ![]const u8 {
+    // Strip whitespace
+    var clean = std.ArrayListUnmanaged(u8){};
+    defer clean.deinit(allocator);
+    for (encoded) |c| {
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') continue;
+        try clean.append(allocator, c);
+    }
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\n\r");
+    const decoded_len = decoder.calcSizeUpperBound(clean.items.len) catch
+        return error.TypeMismatch;
+    const result = try allocator.alloc(u8, decoded_len);
+    const actual_len = decoder.decode(result, clean.items) catch
+        return error.TypeMismatch;
+    return result[0..actual_len];
+}
+
+fn getNodeStringValue(node: Node) []const u8 {
+    return switch (node) {
+        .string => |s| s.value,
+        .literal => |l| l.value,
+        .integer => |i| getTokenValue(i.token),
+        .float_value => |f| getTokenValue(f.token),
+        .boolean => |b| getTokenValue(b.token),
+        .null_value => |n| getTokenValue(n.token),
+        .infinity => |inf| getTokenValue(inf.token),
+        .nan => |n| getTokenValue(n.token),
+        else => "",
+    };
+}
+
+fn getTokenValue(t: ?*const token.Token) []const u8 {
+    if (t) |tok| return tok.value;
+    return "";
+}
+
+fn needsEscapeProcessing(s: ast.StringNode) bool {
+    if (s.token) |tok| {
+        if (tok.token_type == .double_quote) {
+            return std.mem.indexOf(u8, s.value, "\\") != null;
+        }
+    }
+    return false;
+}
+
+fn needsMultilineFolding(s: ast.StringNode) bool {
+    if (s.token) |tok| {
+        if (tok.token_type == .single_quote) {
+            return std.mem.indexOf(u8, s.value, "\n") != null;
+        }
+    }
+    return false;
+}
+
+fn foldMultiline(allocator: Allocator, input: []const u8) ![]const u8 {
+    var buf = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\n') {
+            // Count consecutive newlines
+            var newline_count: usize = 0;
+            while (i < input.len and (input[i] == '\n' or input[i] == '\r')) {
+                if (input[i] == '\n') newline_count += 1;
+                i += 1;
+            }
+            // Skip leading whitespace on the continuation line
+            while (i < input.len and (input[i] == ' ' or input[i] == '\t')) {
+                i += 1;
+            }
+            if (newline_count > 1) {
+                // Multiple newlines: preserve n-1 newlines
+                var n: usize = 0;
+                while (n < newline_count - 1) : (n += 1) {
+                    try buf.append(allocator, '\n');
+                }
+            } else {
+                // Single newline: fold to space
+                try buf.append(allocator, ' ');
+            }
+        } else {
+            try buf.append(allocator, input[i]);
+            i += 1;
+        }
+    }
+    return buf.items;
+}
+
+fn processEscapes(allocator: Allocator, input: []const u8) ![]const u8 {
+    var buf = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            const next = input[i + 1];
+            switch (next) {
+                'x' => {
+                    // \xNN - 2 hex digits
+                    if (i + 3 < input.len) {
+                        const hex = input[i + 2 .. i + 4];
+                        const byte = std.fmt.parseUnsigned(u8, hex, 16) catch {
+                            try buf.append(allocator, input[i]);
+                            i += 1;
+                            continue;
+                        };
+                        try buf.append(allocator, byte);
+                        i += 4;
+                    } else {
+                        try buf.append(allocator, input[i]);
+                        i += 1;
+                    }
+                },
+                'u' => {
+                    // \uNNNN - 4 hex digits
+                    if (i + 5 < input.len) {
+                        const hex = input[i + 2 .. i + 6];
+                        const cp = std.fmt.parseUnsigned(u21, hex, 16) catch {
+                            try buf.append(allocator, input[i]);
+                            i += 1;
+                            continue;
+                        };
+                        var utf8_buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch {
+                            try buf.append(allocator, input[i]);
+                            i += 1;
+                            continue;
+                        };
+                        try buf.appendSlice(allocator, utf8_buf[0..len]);
+                        i += 6;
+                    } else {
+                        try buf.append(allocator, input[i]);
+                        i += 1;
+                    }
+                },
+                'U' => {
+                    // \UNNNNNNNN - 8 hex digits
+                    if (i + 9 < input.len) {
+                        const hex = input[i + 2 .. i + 10];
+                        const cp = std.fmt.parseUnsigned(u21, hex, 16) catch {
+                            try buf.append(allocator, input[i]);
+                            i += 1;
+                            continue;
+                        };
+                        var utf8_buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch {
+                            try buf.append(allocator, input[i]);
+                            i += 1;
+                            continue;
+                        };
+                        try buf.appendSlice(allocator, utf8_buf[0..len]);
+                        i += 10;
+                    } else {
+                        try buf.append(allocator, input[i]);
+                        i += 1;
+                    }
+                },
+                '_' => {
+                    // Non-breaking space U+00A0
+                    try buf.appendSlice(allocator, "\xc2\xa0");
+                    i += 2;
+                },
+                'N' => {
+                    // Next line U+0085
+                    try buf.appendSlice(allocator, "\xc2\x85");
+                    i += 2;
+                },
+                'L' => {
+                    // Line separator U+2028
+                    try buf.appendSlice(allocator, "\xe2\x80\xa8");
+                    i += 2;
+                },
+                'P' => {
+                    // Paragraph separator U+2029
+                    try buf.appendSlice(allocator, "\xe2\x80\xa9");
+                    i += 2;
+                },
+                else => {
+                    try buf.append(allocator, input[i]);
+                    i += 1;
+                },
+            }
+        } else {
+            try buf.append(allocator, input[i]);
+            i += 1;
+        }
+    }
+    return buf.items;
+}
+
+fn decodeToString(allocator: Allocator, node: Node) ![]const u8 {
+    return switch (node) {
+        .string => |s| blk: {
+            var val = s.value;
+            if (needsMultilineFolding(s)) {
+                val = try foldMultiline(allocator, val);
+            }
+            if (needsEscapeProcessing(s)) {
+                val = try processEscapes(allocator, val);
+            }
+            break :blk val;
+        },
+        .literal => |l| l.value,
+        .integer => |i| getTokenValue(i.token),
+        .float_value => |f| getTokenValue(f.token),
+        .boolean => |b| getTokenValue(b.token),
+        .null_value => "",
+        .infinity => |inf| getTokenValue(inf.token),
+        .nan => |n| getTokenValue(n.token),
+        else => error.TypeMismatch,
+    };
+}
+
+fn decodeToInt(comptime T: type, node: Node) !T {
+    const info = @typeInfo(T).int;
+    switch (node) {
+        .integer => |i| {
+            const val = i.value;
+            if (info.signedness == .unsigned) {
+                if (val < 0) return error.Overflow;
+                return std.math.cast(T, @as(u64, @bitCast(val))) orelse
+                    return error.Overflow;
+            }
+            return std.math.cast(T, val) orelse return error.Overflow;
+        },
+        .float_value => |f| {
+            const val = f.value;
+            const truncated = @as(i64, @intFromFloat(val));
+            if (info.signedness == .unsigned) {
+                if (truncated < 0) return error.Overflow;
+                return std.math.cast(T, @as(u64, @bitCast(truncated))) orelse
+                    return error.Overflow;
+            }
+            return std.math.cast(T, truncated) orelse return error.Overflow;
+        },
+        .string => |s| {
+            // Try to parse string as number
+            if (token.toNumber(s.value)) |num| {
+                switch (num) {
+                    .int => |v| {
+                        if (info.signedness == .unsigned) {
+                            if (v < 0) return error.Overflow;
+                            return std.math.cast(T, @as(u64, @bitCast(v))) orelse
+                                return error.Overflow;
+                        }
+                        return std.math.cast(T, v) orelse return error.Overflow;
+                    },
+                    .float => |v| {
+                        const truncated = @as(i64, @intFromFloat(v));
+                        if (info.signedness == .unsigned) {
+                            if (truncated < 0) return error.Overflow;
+                            return std.math.cast(T, @as(u64, @bitCast(truncated))) orelse
+                                return error.Overflow;
+                        }
+                        return std.math.cast(T, truncated) orelse return error.Overflow;
+                    },
+                }
+            }
+            // Fallback: try parsing as u64 for large values
+            return parseIntFromString(T, s.value) orelse return error.TypeMismatch;
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+fn parseIntFromString(comptime T: type, str: []const u8) ?T {
+    const info = @typeInfo(T).int;
+    if (str.len == 0) return null;
+
+    var s = str;
+    var negative = false;
+    if (s[0] == '+' or s[0] == '-') {
+        negative = s[0] == '-';
+        s = s[1..];
+        if (s.len == 0) return null;
+    }
+
+    // Strip underscores and detect base
+    var base: u8 = 10;
+    if (s.len >= 2 and s[0] == '0') {
+        if (s[1] == 'x' or s[1] == 'X') {
+            base = 16;
+            s = s[2..];
+        } else if (s[1] == 'o' or s[1] == 'O') {
+            base = 8;
+            s = s[2..];
+        } else if (s[1] == 'b' or s[1] == 'B') {
+            base = 2;
+            s = s[2..];
+        }
+    }
+
+    var buf: [128]u8 = undefined;
+    var len: usize = 0;
+    for (s) |c| {
+        if (c == '_') continue;
+        if (len >= buf.len) return null;
+        buf[len] = c;
+        len += 1;
+    }
+    if (len == 0) return null;
+    const clean = buf[0..len];
+
+    if (negative) {
+        if (info.signedness == .unsigned) return null;
+        // Try parsing as u64 first to handle large values
+        const unsigned_val = std.fmt.parseUnsigned(u64, clean, base) catch return null;
+        if (unsigned_val == @as(u64, @intCast(std.math.maxInt(i64))) + 1) {
+            // This is min i64
+            return std.math.cast(T, std.math.minInt(i64));
+        }
+        // For values larger than maxInt(i64) + 1, mask to fit
+        const magnitude = if (unsigned_val > @as(u64, @intCast(std.math.maxInt(i64))))
+            unsigned_val & @as(u64, @intCast(std.math.maxInt(i64)))
+        else
+            unsigned_val;
+        const signed: i64 = -@as(i64, @intCast(magnitude));
+        return std.math.cast(T, signed);
+    } else {
+        // Try u64 for large unsigned values
+        const val = std.fmt.parseUnsigned(u64, clean, base) catch return null;
+        if (info.signedness == .unsigned) {
+            return std.math.cast(T, val);
+        }
+        // For signed types, val must fit in i64
+        if (val > @as(u64, @intCast(std.math.maxInt(i64)))) return null;
+        return std.math.cast(T, @as(i64, @intCast(val)));
+    }
+}
+
+fn decodeToFloat(comptime T: type, node: Node) !T {
+    return switch (node) {
+        .float_value => |f| @floatCast(f.value),
+        .integer => |i| @floatFromInt(i.value),
+        .infinity => |inf| if (inf.negative)
+            -std.math.inf(T)
+        else
+            std.math.inf(T),
+        .nan => std.math.nan(T),
+        .string => |s| blk: {
+            // Try to parse as number from string
+            if (token.toNumber(s.value)) |num| {
+                switch (num) {
+                    .int => |v| break :blk @as(T, @floatFromInt(v)),
+                    .float => |v| break :blk @as(T, @floatCast(v)),
+                }
+            }
+            // Fallback: parse directly as float
+            break :blk std.fmt.parseFloat(T, s.value) catch return error.TypeMismatch;
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+fn decodeToBool(node: Node) !bool {
+    return switch (node) {
+        .boolean => |b| b.value,
+        .string => |s| {
+            if (std.mem.eql(u8, s.value, "true") or
+                std.mem.eql(u8, s.value, "True") or
+                std.mem.eql(u8, s.value, "TRUE"))
+                return true;
+            if (std.mem.eql(u8, s.value, "false") or
+                std.mem.eql(u8, s.value, "False") or
+                std.mem.eql(u8, s.value, "FALSE"))
+                return false;
+            return error.TypeMismatch;
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+fn decodeToStruct(
+    comptime T: type,
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !T {
+    if (node == .null_value) {
+        // Null input: return struct with all defaults if possible
+        var result: T = undefined;
+        const fields = std.meta.fields(T);
+        inline for (fields) |field| {
+            if (field.defaultValue()) |dv| {
+                @field(result, field.name) = dv;
+            } else if (@typeInfo(field.type) == .optional) {
+                @field(result, field.name) = null;
+            } else {
+                return error.TypeMismatch;
+            }
+        }
+        return result;
+    }
+    if (node != .mapping) return error.TypeMismatch;
+    const mapping = node.mapping;
+
+    var result: T = undefined;
+    const fields = std.meta.fields(T);
+
+    // Initialize with defaults
+    inline for (fields) |field| {
+        if (field.defaultValue()) |dv| {
+            @field(result, field.name) = dv;
+        }
+    }
+
+    // Track which fields were set
+    var fields_set: [fields.len]bool = [_]bool{false} ** fields.len;
+
+    // Process mapping values
+    for (mapping.values) |mv| {
+        const key_node = mv.key orelse continue;
+        const val_node = mv.value;
+
+        // Check for merge key
+        if (key_node.* == .merge_key or isMergeKeyTag(key_node.*)) {
+            if (val_node) |vn| {
+                try applyMergeToStruct(T, &result, &fields_set, allocator, vn, options, anchors);
+            }
+            continue;
+        }
+
+        const key_str = getKeyString(key_node.*, anchors);
+
+        var field_matched = false;
+        inline for (fields, 0..) |field, idx| {
+            if (std.mem.eql(u8, key_str, field.name)) {
+                if (val_node) |vn| {
+                    @field(result, field.name) =
+                        try decodeNodeInternal(
+                            field.type,
+                            allocator,
+                            vn.*,
+                            options,
+                            anchors,
+                        );
+                } else {
+                    // null value
+                    if (@typeInfo(field.type) == .optional) {
+                        @field(result, field.name) = null;
+                    } else if (comptime isStringType(field.type)) {
+                        @field(result, field.name) = "";
+                    } else if (field.default_value_ptr != null) {
+                        // keep default
+                    }
+                }
+                fields_set[idx] = true;
+                field_matched = true;
+            }
+        }
+
+        // For unmatched fields, still register any anchors
+        if (!field_matched) {
+            if (val_node) |vn| {
+                registerAnchors(vn.*, anchors);
+            }
+        }
+
+        if (options.disallow_unknown_fields) {
+            var found = false;
+            inline for (fields) |field| {
+                if (std.mem.eql(u8, key_str, field.name)) {
+                    found = true;
+                }
+            }
+            if (!found) return error.UnknownField;
+        }
+    }
+
+    // Check required fields
+    inline for (fields, 0..) |field, idx| {
+        if (!fields_set[idx] and field.default_value_ptr == null) {
+            if (@typeInfo(field.type) == .optional) {
+                @field(result, field.name) = null;
+            } else {
+                // Field is required but not set - leave it uninitialized
+                // (this matches behavior where missing non-optional fields
+                //  with no default are zero-initialized)
+            }
+        }
+    }
+
+    return result;
+}
+
+fn isMergeKeyTag(node: Node) bool {
+    if (node != .tag) return false;
+    const tag_str = node.tag.tag;
+    if (std.mem.eql(u8, tag_str, "!!merge")) {
+        if (node.tag.value) |inner| {
+            return inner.* == .merge_key;
+        }
+    }
+    return false;
+}
+
+fn registerAnchors(node: Node, anchors: *AnchorMap) void {
+    switch (node) {
+        .anchor => |a| {
+            if (a.value) |inner| {
+                anchors.put(a.name, inner);
+                registerAnchors(inner.*, anchors);
+            }
+        },
+        .mapping => |m| {
+            for (m.values) |mv| {
+                if (mv.key) |k| registerAnchors(k.*, anchors);
+                if (mv.value) |v| registerAnchors(v.*, anchors);
+            }
+        },
+        .sequence => |s| {
+            for (s.values) |v| registerAnchors(v.*, anchors);
+        },
+        .tag => |t| {
+            if (t.value) |inner| registerAnchors(inner.*, anchors);
+        },
+        .document => |d| {
+            if (d.body) |body| registerAnchors(body.*, anchors);
+        },
+        else => {},
+    }
+}
+
+fn getKeyString(node: Node, anchors: *AnchorMap) []const u8 {
+    return switch (node) {
+        .string => |s| s.value,
+        .integer => |i| getTokenValue(i.token),
+        .boolean => |b| getTokenValue(b.token),
+        .float_value => |f| getTokenValue(f.token),
+        .null_value => |n| getTokenValue(n.token),
+        .literal => |l| l.value,
+        .anchor => |a| blk: {
+            if (a.value) |inner| {
+                anchors.put(a.name, inner);
+                break :blk getKeyString(inner.*, anchors);
+            }
+            break :blk "";
+        },
+        .alias => |a| blk: {
+            if (anchors.get(a.name)) |target| {
+                break :blk getKeyString(target.*, anchors);
+            }
+            break :blk "";
+        },
+        .tag => |t| blk: {
+            if (t.value) |inner| {
+                break :blk getKeyString(inner.*, anchors);
+            }
+            break :blk "";
+        },
+        else => "",
+    };
+}
+
+fn applyMergeToStruct(
+    comptime T: type,
+    result: *T,
+    fields_set: []bool,
+    allocator: Allocator,
+    val_node: *const Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !void {
+    // Resolve the value node through aliases/anchors
+    var resolved = val_node.*;
+    while (true) {
+        if (resolved == .alias) {
+            const name = resolved.alias.name;
+            if (anchors.get(name)) |target| {
+                resolved = target.*;
+                continue;
+            }
+            return;
+        }
+        if (resolved == .anchor) {
+            const anch = resolved.anchor;
+            if (anch.value) |inner| {
+                anchors.put(anch.name, inner);
+                resolved = inner.*;
+                continue;
+            }
+            return;
+        }
+        break;
+    }
+
+    if (resolved == .sequence) {
+        // Merge from sequence of aliases
+        for (resolved.sequence.values) |item| {
+            try applyMergeToStruct(T, result, fields_set, allocator, item, options, anchors);
+        }
+        return;
+    }
+
+    // Handle mapping_value as a single-entry mapping
+    if (resolved == .mapping_value) {
+        const single_mv = resolved.mapping_value;
+        const fields = std.meta.fields(T);
+        if (single_mv.key) |key_node| {
+            const key_str = getKeyString(key_node.*, anchors);
+            const mv_val = single_mv.value;
+            inline for (fields, 0..) |field, idx| {
+                if (std.mem.eql(u8, key_str, field.name)) {
+                    if (!fields_set[idx]) {
+                        if (mv_val) |vn| {
+                            @field(result, field.name) =
+                                try decodeNodeInternal(
+                                    field.type,
+                                    allocator,
+                                    vn.*,
+                                    options,
+                                    anchors,
+                                );
+                        }
+                        fields_set[idx] = true;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (resolved != .mapping) return;
+
+    const fields = std.meta.fields(T);
+    for (resolved.mapping.values) |mv| {
+        const key_node = mv.key orelse continue;
+        const key_str = getKeyString(key_node.*, anchors);
+        const mv_val = mv.value;
+
+        inline for (fields, 0..) |field, idx| {
+            if (std.mem.eql(u8, key_str, field.name)) {
+                if (!fields_set[idx]) {
+                    if (mv_val) |vn| {
+                        @field(result, field.name) =
+                            try decodeNodeInternal(
+                                field.type,
+                                allocator,
+                                vn.*,
+                                options,
+                                anchors,
+                            );
+                    }
+                    fields_set[idx] = true;
+                }
+            }
+        }
+    }
+}
+
+fn decodeToSlice(
+    comptime T: type,
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !T {
+    const Child = @typeInfo(T).pointer.child;
+    if (node != .sequence) return error.TypeMismatch;
+    const seq = node.sequence;
+    const items = try allocator.alloc(Child, seq.values.len);
+    for (seq.values, 0..) |val, i| {
+        items[i] = try decodeNodeInternal(Child, allocator, val.*, options, anchors);
+    }
+    return items;
+}
+
+fn decodeToArray(
+    comptime T: type,
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) !T {
+    const info = @typeInfo(T).array;
+    if (node != .sequence) return error.TypeMismatch;
+    const seq = node.sequence;
+    var result: T = undefined;
+    for (seq.values, 0..) |val, i| {
+        if (i >= info.len) break;
+        result[i] = try decodeNodeInternal(info.child, allocator, val.*, options, anchors);
+    }
+    return result;
+}
+
+fn decodeToValue(
+    allocator: Allocator,
+    node: Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) DecodeErrorSet!Value {
+    return switch (node) {
+        .null_value => .null,
+        .boolean => |b| Value{ .boolean = b.value },
+        .integer => |i| Value{ .integer = i.value },
+        .float_value => |f| Value{ .float = f.value },
+        .infinity => |inf| Value{
+            .float = if (inf.negative)
+                -std.math.inf(f64)
+            else
+                std.math.inf(f64),
+        },
+        .nan => Value{ .float = std.math.nan(f64) },
+        .string => |s| blk: {
+            var val = s.value;
+            if (needsMultilineFolding(s)) {
+                val = try foldMultiline(allocator, val);
+            }
+            if (needsEscapeProcessing(s)) {
+                val = try processEscapes(allocator, val);
+            }
+            break :blk Value{ .string = val };
+        },
+        .literal => |l| Value{ .string = l.value },
+        .mapping => |m| try decodeMappingToValue(allocator, m, options, anchors),
+        .sequence => |s| blk: {
+            const items = try allocator.alloc(Value, s.values.len);
+            for (s.values, 0..) |val, i| {
+                items[i] = try decodeToValue(allocator, val.*, options, anchors);
+            }
+            break :blk Value{ .sequence = items };
+        },
+        .anchor => |a| blk: {
+            if (a.value) |inner| {
+                anchors.put(a.name, inner);
+                anchors.markActive(a.name);
+                const result = try decodeToValue(allocator, inner.*, options, anchors);
+                anchors.unmarkActive(a.name);
+                break :blk result;
+            }
+            break :blk .null;
+        },
+        .alias => |a| blk: {
+            if (anchors.isActive(a.name)) break :blk Value.null;
+            if (anchors.get(a.name)) |target| {
+                anchors.markActive(a.name);
+                const result = try decodeToValue(allocator, target.*, options, anchors);
+                anchors.unmarkActive(a.name);
+                break :blk result;
+            }
+            break :blk error.Unimplemented;
+        },
+        .document => |d| blk: {
+            if (d.body) |body| {
+                break :blk try decodeToValue(allocator, body.*, options, anchors);
+            }
+            break :blk .null;
+        },
+        .mapping_value => |mv| try decodeMappingValueToValue(allocator, mv, options, anchors),
+        .tag => |t| blk: {
+            if (t.value) |inner| {
+                break :blk try decodeToValue(allocator, inner.*, options, anchors);
+            }
+            break :blk .null;
+        },
+        .merge_key => .null,
+        else => .null,
+    };
+}
+
+fn decodeMappingToValue(
+    allocator: Allocator,
+    mapping: ast.MappingNode,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) DecodeErrorSet!Value {
+    // First pass: count total entries including merges
+    var keys_list = std.ArrayListUnmanaged(Value){};
+    var vals_list = std.ArrayListUnmanaged(Value){};
+    defer keys_list.deinit(allocator);
+    defer vals_list.deinit(allocator);
+
+    for (mapping.values) |mv| {
+        const key_node = mv.key orelse continue;
+        const val_node = mv.value;
+
+        // Check for merge key
+        if (key_node.* == .merge_key or isMergeKeyTag(key_node.*)) {
+            if (val_node) |vn| {
+                try applyMergeToValueMap(allocator, &keys_list, &vals_list, vn, options, anchors);
+            }
+            continue;
+        }
+
+        const key_val = try decodeToValue(allocator, key_node.*, options, anchors);
+        const val_val = if (val_node) |vn|
+            try decodeToValue(allocator, vn.*, options, anchors)
+        else
+            Value.null;
+
+        // Check for duplicate keys - replace existing
+        var found = false;
+        for (keys_list.items, 0..) |existing_key, idx| {
+            if (existing_key.eql(key_val)) {
+                vals_list.items[idx] = val_val;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try keys_list.append(allocator, key_val);
+            try vals_list.append(allocator, val_val);
+        }
+    }
+
+    const keys = try allocator.alloc(Value, keys_list.items.len);
+    const vals = try allocator.alloc(Value, vals_list.items.len);
+    @memcpy(keys, keys_list.items);
+    @memcpy(vals, vals_list.items);
+
+    return Value{ .mapping = .{ .keys = keys, .values = vals } };
+}
+
+const DecodeErrorSet = error{
+    TypeMismatch,
+    Overflow,
+    UnknownField,
+    MissingField,
+    InvalidAnchor,
+    Unimplemented,
+    OutOfMemory,
+};
+
+fn applyMergeToValueMap(
+    allocator: Allocator,
+    keys_list: *std.ArrayListUnmanaged(Value),
+    vals_list: *std.ArrayListUnmanaged(Value),
+    val_node: *const Node,
+    options: DecodeOptions,
+    anchors: *AnchorMap,
+) DecodeErrorSet!void {
+    // Resolve through aliases/anchors
+    var resolved = val_node.*;
+    while (true) {
+        if (resolved == .alias) {
+            const name = resolved.alias.name;
+            if (anchors.get(name)) |target| {
+                resolved = target.*;
+                continue;
+            }
+            return;
+        }
+        if (resolved == .anchor) {
+            const anch = resolved.anchor;
+            if (anch.value) |inner| {
+                anchors.put(anch.name, inner);
+                resolved = inner.*;
+                continue;
+            }
+            return;
+        }
+        break;
+    }
+
+    if (resolved == .sequence) {
+        // Merge from sequence of aliases
+        for (resolved.sequence.values) |item| {
+            try applyMergeToValueMap(allocator, keys_list, vals_list, item, options, anchors);
+        }
+        return;
+    }
+
+    // Handle mapping_value as a single-entry mapping
+    if (resolved == .mapping_value) {
+        const mv = resolved.mapping_value;
+        const key_node = mv.key orelse return;
+        const key_val = try decodeToValue(allocator, key_node.*, options, anchors);
+        const val_val = if (mv.value) |vn|
+            try decodeToValue(allocator, vn.*, options, anchors)
+        else
+            Value.null;
+        var found = false;
+        for (keys_list.items) |existing| {
+            if (existing.eql(key_val)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try keys_list.append(allocator, key_val);
+            try vals_list.append(allocator, val_val);
+        }
+        return;
+    }
+
+    if (resolved != .mapping) {
+        // Non-mapping merge source - nothing to merge
+        return;
+    }
+
+    // Merge from mapping - existing keys take precedence
+    for (resolved.mapping.values) |mv| {
+        const key_node = mv.key orelse continue;
+        const key_val = try decodeToValue(allocator, key_node.*, options, anchors);
+        const val_val = if (mv.value) |vn|
+            try decodeToValue(allocator, vn.*, options, anchors)
+        else
+            Value.null;
+
+        var found = false;
+        for (keys_list.items) |existing| {
+            if (existing.eql(key_val)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try keys_list.append(allocator, key_val);
+            try vals_list.append(allocator, val_val);
+        }
+    }
 }
 
 fn testDecode(comptime T: type, source: []const u8) !T {
