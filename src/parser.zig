@@ -1190,7 +1190,7 @@ pub const Parser = struct {
             } else if (next.token_type == .literal or next.token_type == .folded) {
                 value_node = try self.parseBlockScalar();
             } else if (next.token_type == .sequence_entry) {
-                // Anchor on sequence.
+                value_node = try self.parseBlockSequence(min_indent);
             } else if (next.token_type == .mapping_value) {
                 // Anchor without value (key: &anchor).
             }
@@ -1280,6 +1280,8 @@ pub const Parser = struct {
                 value_node = try self.parseAnchor(min_indent, in_flow);
             } else if (next.token_type == .mapping_key) {
                 value_node = try self.parseExplicitKey(min_indent, in_flow);
+            } else if (next.token_type == .merge_key) {
+                value_node = try self.parseMergeKeyValue(min_indent, in_flow);
             }
         }
 
