@@ -1999,21 +1999,24 @@ test "encode round-trip integer" {
     const encoded = try testEncode(@as(i64, 42));
     defer testing.allocator.free(encoded);
     const decoded = try decoder.decode(i64, testing.allocator, encoded, .{});
-    try testing.expectEqual(@as(i64, 42), decoded);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(i64, 42), decoded.value);
 }
 
 test "encode round-trip string" {
     const encoded = try testEncode(@as([]const u8, "hello"));
     defer testing.allocator.free(encoded);
     const decoded = try decoder.decode([]const u8, testing.allocator, encoded, .{});
-    try testing.expectEqualStrings("hello", decoded);
+    defer decoded.deinit();
+    try testing.expectEqualStrings("hello", decoded.value);
 }
 
 test "encode round-trip bool" {
     const encoded = try testEncode(true);
     defer testing.allocator.free(encoded);
     const decoded = try decoder.decode(bool, testing.allocator, encoded, .{});
-    try testing.expect(decoded);
+    defer decoded.deinit();
+    try testing.expect(decoded.value);
 }
 
 test "encode f64 scientific small" {

@@ -5,6 +5,7 @@ const testing = std.testing;
 pub const ast = @import("ast.zig");
 pub const Node = ast.Node;
 pub const decoder = @import("decode.zig");
+pub const Parsed = decoder.Parsed;
 pub const emitter = @import("emitter.zig");
 pub const encoder = @import("encode.zig");
 pub const err = @import("error.zig");
@@ -145,7 +146,7 @@ pub fn emit(allocator: Allocator, doc: Document) ![]u8 {
     return emitter.emit(allocator, body.*, .{});
 }
 
-pub fn decode(comptime T: type, allocator: Allocator, source: []const u8) !T {
+pub fn decode(comptime T: type, allocator: Allocator, source: []const u8) !decoder.Parsed(T) {
     return decoder.decode(T, allocator, source, .{});
 }
 
@@ -208,17 +209,11 @@ test "full pipeline parse decode encode" {
         \\port: 3000
         \\
     ;
-    const config = try decode(
-        Config,
-        testing.allocator,
-        input,
-    );
-    try testing.expectEqualStrings("myapp", config.name);
-    try testing.expectEqual(@as(u16, 3000), config.port);
-    const output = try encode(
-        testing.allocator,
-        config,
-    );
+    const parsed = try decode(Config, testing.allocator, input);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("myapp", parsed.value.name);
+    try testing.expectEqual(@as(u16, 3000), parsed.value.port);
+    const output = try encode(testing.allocator, parsed.value);
     defer testing.allocator.free(output);
     try testing.expectEqualStrings(input, output);
 }
