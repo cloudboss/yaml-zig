@@ -307,13 +307,22 @@ pub const Parser = struct {
         }
 
         // Tag.
-        if (tt == .tag) return try self.parseTag(min_indent, in_flow);
+        if (tt == .tag) {
+            const tag_node = try self.parseTag(min_indent, in_flow);
+            return try self.promoteToMapping(tag_node, min_indent, in_flow);
+        }
 
         // Anchor.
-        if (tt == .anchor) return try self.parseAnchor(min_indent, in_flow);
+        if (tt == .anchor) {
+            const anchor_node = try self.parseAnchor(min_indent, in_flow);
+            return try self.promoteToMapping(anchor_node, min_indent, in_flow);
+        }
 
         // Alias.
-        if (tt == .alias) return try self.parseAlias();
+        if (tt == .alias) {
+            const alias_node = try self.parseAlias();
+            return try self.promoteToMapping(alias_node, min_indent, in_flow);
+        }
 
         // Merge key.
         if (tt == .merge_key) {
@@ -347,6 +356,51 @@ pub const Parser = struct {
         if (tt == .collect_entry or tt == .mapping_value) return null;
 
         return null;
+    }
+
+    // Check if a node (anchor, tag, alias) is followed by ':' making it a
+    // mapping key. Build a mapping_value and potentially a full mapping.
+    fn promoteToMapping(
+        self: *Parser,
+        key_node: *Node,
+        min_indent: u32,
+        in_flow: bool,
+    ) ParseErr!*Node {
+        if (in_flow) return key_node;
+        const key_tok = key_node.getToken() orelse return key_node;
+        const key_col = key_tok.position.column;
+        const key_indent = key_tok.position.indent_num;
+        // Peek for ':' without consuming comments.
+        if (!self.peekThroughComments(.mapping_value)) return key_node;
+        const pre_comment = try self.collectComments();
+        const mv_node = try self.parseMappingValue(
+            key_node,
+            key_col,
+            key_indent,
+            false,
+            pre_comment,
+            min_indent,
+        );
+        // Check for sibling key-value pairs at the same column.
+        self.skipComments();
+        if (self.pos < self.tokens.len) {
+            const next = self.current();
+            if (self.isKeyToken(next.token_type) and
+                next.position.column == key_col and key_col >= min_indent)
+            {
+                if (self.peekForMappingValue(next.position.column)) {
+                    const mv = mv_node.*.mapping_value;
+                    return try self.parseMappingWithFirst(
+                        key_node,
+                        mv.value.?,
+                        key_col,
+                        min_indent,
+                        mv.node_comment,
+                    );
+                }
+            }
+        }
+        return mv_node;
     }
 
     fn parseScalarOrMapping(self: *Parser, min_indent: u32, in_flow: bool) ParseErr!?*Node {
@@ -433,6 +487,29 @@ pub const Parser = struct {
         return i < self.tokens.len and self.tokens[i].token_type == expected;
     }
 
+    // Scan ahead on the same line through anchors, tags, scalars, and
+    // comments to find a mapping_value token.
+    fn hasMappingValueAhead(self: *const Parser) bool {
+        if (self.pos >= self.tokens.len) return false;
+        const start_line = self.tokens[self.pos].position.line;
+        var i = self.pos;
+        while (i < self.tokens.len) {
+            if (self.tokens[i].position.line != start_line) break;
+            const tt = self.tokens[i].token_type;
+            if (tt == .mapping_value) return true;
+            if (tt == .comment or tt == .anchor or tt == .alias or tt == .tag) {
+                i += 1;
+                continue;
+            }
+            if (self.isScalarToken(tt)) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        return false;
+    }
+
     fn lookAheadMappingValue(self: *const Parser) bool {
         return self.lookAheadMappingValueFrom(self.pos);
     }
@@ -499,12 +576,8 @@ pub const Parser = struct {
                 value_node = try self.parseFlowMapping();
             } else if (val_tt == .sequence_start) {
                 value_node = try self.parseFlowSequence();
-            } else if (val_tt == .anchor) {
-                value_node = try self.parseAnchor(key_col + 1, false);
-            } else if (val_tt == .alias) {
-                value_node = try self.parseAlias();
-            } else if (val_tt == .tag) {
-                value_node = try self.parseTag(key_col + 1, false);
+            } else if (val_tt == .anchor or val_tt == .alias or val_tt == .tag) {
+                value_node = try self.parseNode(key_col + 1, false);
             } else if (val_tt == .merge_key) {
                 value_node = try self.parseMergeKeyValue(key_col + 1, false);
             } else if (self.isScalarToken(val_tt)) {
@@ -580,6 +653,10 @@ pub const Parser = struct {
                 self.tokens[i].position.column == col)
             {
                 i += 1;
+                // Also skip the value token after an anchor/tag.
+                if (i < self.tokens.len and self.isScalarToken(self.tokens[i].token_type)) {
+                    i += 1;
+                }
                 continue;
             }
             break;
@@ -718,7 +795,22 @@ pub const Parser = struct {
                 node = alias;
             }
         } else if (tt == .tag) {
-            node = try self.parseTag(min_indent, false);
+            const tag = try self.parseTag(min_indent, false);
+            self.skipComments();
+            if (self.pos < self.tokens.len and
+                self.tokens[self.pos].token_type == .mapping_value)
+            {
+                node = try self.parseMappingValue(
+                    tag,
+                    col,
+                    ind,
+                    false,
+                    null,
+                    min_indent,
+                );
+            } else {
+                node = tag;
+            }
         } else {
             const key = try self.parseScalarValue();
             self.skipComments();
@@ -904,6 +996,16 @@ pub const Parser = struct {
                     .value = value_node,
                 } });
                 try entries.append(self.allocator, &mv.mapping_value);
+                // After a key-value pair, expect ',' or '}'.
+                self.skipComments();
+                if (self.pos < self.tokens.len) {
+                    const nt = self.tokens[self.pos].token_type;
+                    if (nt != .mapping_end and nt != .collect_entry) {
+                        return self.syntaxError(
+                            "expected ',' or '}' in flow mapping",
+                        );
+                    }
+                }
             } else {
                 // Bare key (no value).
                 const null_val = try self.createNode(Node{ .null_value = .{} });
@@ -915,13 +1017,6 @@ pub const Parser = struct {
             }
         } else {
             return self.syntaxError("unclosed flow mapping");
-        }
-
-        // Check if this flow mapping is used as a key (followed by ':').
-        if (self.pos < self.tokens.len and
-            self.tokens[self.pos].token_type == .mapping_value)
-        {
-            return self.syntaxError("flow mapping as key");
         }
 
         const mapping = try self.createNode(Node{ .mapping = .{
@@ -1000,13 +1095,6 @@ pub const Parser = struct {
             }
         } else {
             return self.syntaxError("unclosed flow sequence");
-        }
-
-        // Check if flow seq used as key.
-        if (self.pos < self.tokens.len and
-            self.tokens[self.pos].token_type == .mapping_value)
-        {
-            return self.syntaxError("flow sequence as key");
         }
 
         const seq = try self.createNode(Node{ .sequence = .{
@@ -1168,6 +1256,7 @@ pub const Parser = struct {
     }
 
     fn parseAnchor(self: *Parser, min_indent: u32, in_flow: bool) ParseErr!*Node {
+        const anchor_pos = self.pos;
         const tok = self.current();
         const name = tok.origin; // Anchor name stored in origin by scanner.
         self.advance();
@@ -1182,35 +1271,51 @@ pub const Parser = struct {
                 value_node = try self.parseFlowMapping();
             } else if (next.token_type == .sequence_start) {
                 value_node = try self.parseFlowSequence();
-            } else if (self.isScalarToken(next.token_type)) {
-                // Only parse as anchor value if on same line or in flow.
+            } else if (next.token_type == .tag) {
+                // Anchor followed by tag, e.g. `&a !!str val`.
                 if (in_flow or next.position.line == anchor_line) {
-                    value_node = try self.parseScalarOrMapping(min_indent, in_flow);
+                    value_node = try self.parseTag(min_indent, in_flow);
+                }
+            } else if (self.isScalarToken(next.token_type)) {
+                // Parse just the scalar. The caller handles ':' promotion.
+                if (in_flow or next.position.line == anchor_line) {
+                    value_node = try self.parseScalarValue();
                 }
             } else if (next.token_type == .literal or next.token_type == .folded) {
                 value_node = try self.parseBlockScalar();
             } else if (next.token_type == .sequence_entry) {
-                value_node = try self.parseBlockSequence(min_indent);
+                // Only parse if the sequence entry meets the indent threshold.
+                if (next.position.column >= min_indent) {
+                    value_node = try self.parseBlockSequence(min_indent);
+                }
             } else if (next.token_type == .mapping_value) {
-                // Anchor without value (key: &anchor).
+                // Anchor without value (key: &anchor\n ...).
             }
         }
 
-        // Check for mapping value after anchor's value,
-        // e.g., "- &anchor\n  key: val" where the anchor wraps a mapping.
+        // Check for content on a following line when anchor has no value yet.
         if (value_node == null and !in_flow and self.pos < self.tokens.len) {
             const next = self.current();
-            // Only parse if on a deeper indent.
-            if ((self.isScalarToken(next.token_type) or
-                next.token_type == .mapping_key) and
-                next.position.column >= min_indent)
-            {
-                value_node = try self.parseNode(min_indent, false);
+            if (next.position.column >= min_indent) {
+                if (self.isScalarToken(next.token_type) or
+                    next.token_type == .mapping_key)
+                {
+                    value_node = try self.parseNode(min_indent, false);
+                } else if (next.token_type == .tag) {
+                    // Tag on next line is the anchor's value.
+                    value_node = try self.parseNode(min_indent, false);
+                } else if (next.token_type == .anchor) {
+                    // Only consume a nested anchor if it leads to a mapping
+                    // (double-anchor on a bare scalar is invalid).
+                    if (self.hasMappingValueAhead()) {
+                        value_node = try self.parseNode(min_indent, false);
+                    }
+                }
             }
         }
 
         const node = try self.createNode(Node{ .anchor = .{
-            .token = &self.tokens[self.pos - 1],
+            .token = &self.tokens[anchor_pos],
             .name = name,
             .value = value_node,
         } });
@@ -1230,7 +1335,7 @@ pub const Parser = struct {
 
     // Parse a scalar value after a tag, re-classifying string tokens that
     // the scanner forced to .string (because they follow a tag).
-    fn parseTagScalarValue(self: *Parser, min_indent: u32, in_flow: bool) ParseErr!?*Node {
+    fn parseTagScalarValue(self: *Parser) ParseErr!?*Node {
         // If the token is a .string that the scanner forced (after tag),
         // try to re-parse it as its natural type.
         if (self.pos < self.tokens.len and
@@ -1253,12 +1358,14 @@ pub const Parser = struct {
                 };
             }
         }
-        return try self.parseScalarOrMapping(min_indent, in_flow);
+        return try self.parseScalarValue();
     }
 
     fn parseTag(self: *Parser, min_indent: u32, in_flow: bool) ParseErr!*Node {
+        const tag_pos = self.pos;
         const tok = self.current();
         const tag_str = tok.value;
+        const tag_line = tok.position.line;
         self.advance();
 
         self.skipComments();
@@ -1273,11 +1380,20 @@ pub const Parser = struct {
             } else if (next.token_type == .literal or next.token_type == .folded) {
                 value_node = try self.parseBlockScalar();
             } else if (self.isScalarToken(next.token_type)) {
-                value_node = try self.parseTagScalarValue(min_indent, in_flow);
+                // Only parse same-line scalars directly. Different-line
+                // scalars are handled by the fallback to get full sub-trees.
+                if (in_flow or next.position.line == tag_line) {
+                    value_node = try self.parseTagScalarValue();
+                }
             } else if (next.token_type == .sequence_entry) {
-                value_node = try self.parseBlockSequence(min_indent);
+                // Only parse if the sequence entry meets the indent threshold.
+                if (next.position.column >= min_indent) {
+                    value_node = try self.parseBlockSequence(min_indent);
+                }
             } else if (next.token_type == .anchor) {
                 value_node = try self.parseAnchor(min_indent, in_flow);
+            } else if (next.token_type == .alias) {
+                value_node = try self.parseAlias();
             } else if (next.token_type == .mapping_key) {
                 value_node = try self.parseExplicitKey(min_indent, in_flow);
             } else if (next.token_type == .merge_key) {
@@ -1285,8 +1401,22 @@ pub const Parser = struct {
             }
         }
 
+        // Check for content on a following line when tag has no value yet.
+        if (value_node == null and !in_flow and self.pos < self.tokens.len) {
+            const next = self.current();
+            if (next.position.line != tag_line and
+                (self.isScalarToken(next.token_type) or
+                    next.token_type == .mapping_key or
+                    next.token_type == .anchor or
+                    next.token_type == .tag) and
+                next.position.column >= min_indent)
+            {
+                value_node = try self.parseNode(min_indent, false);
+            }
+        }
+
         const node = try self.createNode(Node{ .tag = .{
-            .token = &self.tokens[self.pos -| 1],
+            .token = &self.tokens[tag_pos],
             .tag = tag_str,
             .value = value_node,
         } });

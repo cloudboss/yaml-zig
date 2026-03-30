@@ -68,8 +68,20 @@ pub const Scanner = struct {
             } else if (c == '.' and self.column == 0 and self.matchDocMarker("...")) {
                 try self.addToken(.document_end, "...");
                 self.advance(3);
+                self.skipInlineWhitespace();
+                // Only comments or newlines are valid after document end marker.
+                if (self.pos < self.source.len and !isNewline(self.source[self.pos]) and
+                    self.source[self.pos] != '#')
+                {
+                    return error.SyntaxError;
+                }
             } else if (c == '#' and (self.column == 0 or self.isPrecededByWhitespace())) {
                 try self.scanComment();
+            } else if (c == '#' and self.flow_level > 0 and
+                self.lastTokenType() == .collect_entry)
+            {
+                // '#' immediately after ',' without whitespace is invalid.
+                return error.SyntaxError;
             } else if (c == '\'') {
                 try self.scanSingleQuoted();
             } else if (c == '"') {
@@ -91,6 +103,15 @@ pub const Scanner = struct {
                 try self.addToken(.sequence_end, "]");
                 self.advance(1);
             } else if (c == ',') {
+                // Reject consecutive commas or leading comma in flow context.
+                if (self.flow_level > 0) {
+                    const last = self.lastTokenType();
+                    if (last == .collect_entry or last == .sequence_start or
+                        last == .mapping_start)
+                    {
+                        return error.SyntaxError;
+                    }
+                }
                 try self.addToken(.collect_entry, ",");
                 self.advance(1);
             } else if (c == '?' and (self.pos + 1 >= self.source.len or
@@ -278,7 +299,17 @@ pub const Scanner = struct {
         while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
             self.advance(1);
         }
-        try self.addToken(.directive, self.source[start..self.pos]);
+        const text = self.source[start..self.pos];
+        // Validate %YAML directive has no extra words after version.
+        if (text.len >= 5 and std.mem.eql(u8, text[0..5], "%YAML")) {
+            // Skip "%YAML", then whitespace, then version, then check for more.
+            var i: usize = 5;
+            while (i < text.len and isWhitespace(text[i])) i += 1;
+            while (i < text.len and !isWhitespace(text[i])) i += 1;
+            while (i < text.len and isWhitespace(text[i])) i += 1;
+            if (i < text.len and text[i] != '#') return error.SyntaxError;
+        }
+        try self.addToken(.directive, text);
     }
 
     fn scanComment(self: *Scanner) !void {
@@ -295,6 +326,8 @@ pub const Scanner = struct {
         var buf: Buf = .empty;
         var closed = false;
         while (self.pos < self.source.len) {
+            // Document markers at column 0 terminate the quoted scalar.
+            if (self.column == 0 and self.looksLikeDocMarker()) return error.SyntaxError;
             const c = self.source[self.pos];
             if (c == '\'') {
                 if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\'') {
@@ -319,6 +352,8 @@ pub const Scanner = struct {
         var buf: Buf = .empty;
         var closed = false;
         while (self.pos < self.source.len) {
+            // Document markers at column 0 terminate the quoted scalar.
+            if (self.column == 0 and self.looksLikeDocMarker()) return error.SyntaxError;
             const c = self.source[self.pos];
             if (c == '"') {
                 self.advance(1);
@@ -383,12 +418,19 @@ pub const Scanner = struct {
             'f' => try self.bufAppend(buf, 0x0C),
             'v' => try self.bufAppend(buf, 0x0B),
             'e' => try self.bufAppend(buf, 0x1B),
-            ' ' => try self.bufAppend(buf, ' '),
+            ' ', '\t' => try self.bufAppend(buf, c),
             '/' => try self.bufAppend(buf, '/'),
-            else => {
+            'N', '_', 'L', 'P' => {
+                // Unicode escapes handled by decoder.
                 try self.bufAppend(buf, '\\');
                 try self.bufAppend(buf, c);
             },
+            'x', 'u', 'U' => {
+                // Hex/unicode escapes handled by decoder.
+                try self.bufAppend(buf, '\\');
+                try self.bufAppend(buf, c);
+            },
+            else => return error.SyntaxError,
         }
     }
 
