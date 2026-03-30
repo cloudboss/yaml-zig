@@ -25,6 +25,7 @@ pub const Scanner = struct {
     token_offset: u32 = 0,
     token_indent: u32 = 0,
     last_key_indent: u32 = 0,
+    block_indent: ?u32 = null,
     tag_directives: std.StringHashMapUnmanaged([]const u8) = .empty,
     pending_tag_directives: std.StringHashMapUnmanaged([]const u8) = .empty,
     has_pending_tags: bool = false,
@@ -180,12 +181,19 @@ pub const Scanner = struct {
 
     fn addToken(self: *Scanner, tt: TokenType, val: []const u8) !void {
         if (tt == .mapping_value) {
-            // Track the key's indent for multiline continuation
+            // Track the key's indent for multiline continuation.
             if (self.tokens.items.len > 0) {
                 self.last_key_indent =
                     self.tokens.items[self.tokens.items.len - 1]
                         .position.indent_num;
             }
+            // In block context, quoted continuations must indent past the key.
+            self.block_indent = if (self.flow_level == 0)
+                self.last_key_indent
+            else
+                null;
+        } else if (tt != .comment) {
+            self.block_indent = null;
         }
         try self.tokens.append(self.a(), .{
             .token_type = tt,
@@ -523,6 +531,7 @@ pub const Scanner = struct {
                         break;
                     }
                 }
+                try self.validateQuotedContinuation();
                 if (blank_lines > 0) {
                     for (0..blank_lines) |_| try self.bufAppend(&buf, '\n');
                 } else {
@@ -535,6 +544,32 @@ pub const Scanner = struct {
         }
         if (!closed) return error.UnexpectedEof;
         try self.addToken(.double_quote, buf.items);
+    }
+
+    /// Validate that a quoted scalar continuation line is properly indented
+    /// relative to the enclosing block mapping key.
+    fn validateQuotedContinuation(self: *Scanner) !void {
+        const indent = self.block_indent orelse return;
+        if (self.pos >= self.source.len) return;
+        // Count leading spaces from the start of the line. Tabs don't count
+        // as indentation, so only spaces contribute to the indent level.
+        const line_start = self.findLineStart();
+        var spaces: u32 = 0;
+        for (self.source[line_start..self.pos]) |ch| {
+            if (ch == ' ') {
+                spaces += 1;
+            } else break;
+        }
+        if (spaces <= indent) return error.SyntaxError;
+    }
+
+    fn findLineStart(self: *Scanner) usize {
+        var i = self.pos;
+        while (i > 0) {
+            if (self.source[i - 1] == '\n' or self.source[i - 1] == '\r') break;
+            i -= 1;
+        }
+        return i;
     }
 
     fn appendEscapeChar(self: *Scanner, buf: *Buf, c: u8) !void {
