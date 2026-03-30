@@ -672,9 +672,11 @@ pub const Scanner = struct {
             content_indent = ei;
         }
 
-        // Collect lines: each iteration processes one line
-        // pending_blanks tracks blank lines seen since last content line
+        // Collect lines: each iteration processes one line.
+        // pending_blanks tracks blank lines seen since last content line.
         var pending_blanks: usize = 0;
+        // Track max indent of blank lines before content_indent is known.
+        var max_pending_indent: u32 = 0;
 
         while (self.pos < self.source.len) {
             // Count leading spaces. Tabs in indentation are invalid.
@@ -710,18 +712,15 @@ pub const Scanner = struct {
                     {
                         return error.TabInIndent;
                     }
+                    if (line_spaces > max_pending_indent)
+                        max_pending_indent = line_spaces;
                     pending_blanks += 1;
                     self.pos = tmp_pos;
                     if (self.pos < self.source.len) self.advance(1);
                     continue;
                 }
                 if (line_spaces == 0) {
-                    // Zero-indent content is valid only when the block
-                    // scalar follows a document header (--- >). Detect
-                    // this by checking if a document_header token
-                    // precedes the block scalar header.
                     if (after_doc_header) {
-                        // Still stop at doc markers and comments.
                         if (tmp_pos < self.source.len and
                             (self.looksLikeDocMarkerAt(tmp_pos) or
                                 self.source[tmp_pos] == '#'))
@@ -735,6 +734,11 @@ pub const Scanner = struct {
                 } else {
                     content_indent = line_spaces;
                 }
+                // Reject when preceding blank lines had more trailing
+                // spaces than the content indent — this creates an
+                // ambiguity about whether those spaces are content.
+                if (max_pending_indent > content_indent.?)
+                    return error.SyntaxError;
             }
 
             const ci = content_indent.?;
