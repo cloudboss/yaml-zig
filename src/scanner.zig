@@ -181,11 +181,17 @@ pub const Scanner = struct {
 
     fn addToken(self: *Scanner, tt: TokenType, val: []const u8) !void {
         if (tt == .mapping_value) {
-            // Track the key's indent for multiline continuation.
+            // Track the key's column for multiline continuation. Use the
+            // key token's column so that keys inside sequence entries like
+            // `- key: value` get the correct continuation threshold.
             if (self.tokens.items.len > 0) {
-                self.last_key_indent =
-                    self.tokens.items[self.tokens.items.len - 1]
-                        .position.indent_num;
+                const prev = self.tokens.items[self.tokens.items.len - 1];
+                // For explicit keys (preceded by '?'), the mapping indent is
+                // the line indent where ':' appears, not the key's column.
+                self.last_key_indent = if (self.hasExplicitKeyBefore())
+                    self.line_indent
+                else
+                    prev.position.column;
             }
             // In block context, quoted continuations must indent past the key.
             self.block_indent = if (self.flow_level == 0)
@@ -892,6 +898,19 @@ pub const Scanner = struct {
         const tag = self.source[start..self.pos];
         try self.validateTagHandle(tag);
         try self.addToken(.tag, tag);
+    }
+
+    fn hasExplicitKeyBefore(self: *Scanner) bool {
+        var i = self.tokens.items.len;
+        while (i > 0) {
+            i -= 1;
+            const tt = self.tokens.items[i].token_type;
+            if (tt == .mapping_key) return true;
+            // Stop at tokens that can't be part of the key expression.
+            if (tt == .mapping_value or tt == .sequence_entry or
+                tt == .document_header or tt == .document_end) return false;
+        }
+        return false;
     }
 
     fn activateTagDirectives(self: *Scanner) void {
