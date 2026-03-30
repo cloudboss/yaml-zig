@@ -2,66 +2,9 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-const Value = @import("value.zig").Value;
 const yaml = @import("yaml.zig");
 
-const suite_dir = "testdata/yaml-test-suite";
-
-const known_failures = [_][]const u8{
-    "anchors-on-empty-scalars",
-    "aliases-in-flow-objects",
-    "aliases-in-explicit-block-mapping",
-    "block-mapping-with-missing-keys",
-    "empty-implicit-key-in-single-pair-flow-sequences",
-    "empty-keys-in-block-and-flow-mapping",
-    "empty-lines-at-end-of-document",
-    "flow-mapping-separate-values",
-    "flow-sequence-in-flow-mapping",
-    "implicit-flow-mapping-key-on-one-line",
-    "mapping-key-and-flow-sequence-item-anchors",
-    "nested-implicit-complex-keys",
-    "single-pair-implicit-entries",
-    "spec-example-2-11-mapping-between-sequences",
-    "spec-example-6-12-separation-spaces",
-    "spec-example-7-16-flow-mapping-entries",
-    "spec-example-7-3-completely-empty-flow-nodes",
-    "spec-example-8-18-implicit-block-mapping-entries",
-    "spec-example-8-19-compact-block-mappings",
-    "tags-on-empty-scalars",
-    "various-combinations-of-explicit-block-mappings",
-    "various-trailing-comments",
-    "various-trailing-comments-1-3",
-    "zero-indented-sequences-in-explicit-mapping-keys",
-    "colon-at-the-beginning-of-adjacent-flow-scalar",
-    "comment-without-whitespace-after-doublequoted-scalar",
-    "construct-binary",
-    "dash-in-flow-sequence",
-    "invalid-comment-after-comma",
-    "invalid-comment-after-end-of-flow-sequence",
-    "invalid-comma-in-tag",
-    "plain-dashes-in-flow-sequence",
-    "spec-example-9-3-bare-documents",
-    "spec-example-9-6-stream",
-    "spec-example-9-6-stream-1-3",
-    "trailing-line-of-spaces/01",
-    "wrong-indented-flow-sequence",
-    "wrong-indented-multiline-quoted-scalar",
-};
-
-fn isKnownFailure(name: []const u8) bool {
-    for (&known_failures) |f| {
-        if (std.mem.eql(u8, name, f)) return true;
-    }
-    if (std.mem.startsWith(u8, name, "question-mark-edge-cases/")) return true;
-    if (std.mem.startsWith(u8, name, "single-character-streams/")) return true;
-    if (std.mem.startsWith(u8, name, "syntax-character-edge-cases/")) return true;
-    if (std.mem.startsWith(u8, name, "flow-collections-over-many-lines/")) return true;
-    if (std.mem.startsWith(u8, name, "flow-mapping-colon-on-line-after-key/")) return true;
-    if (std.mem.startsWith(u8, name, "tabs-in-various-contexts/")) return true;
-    if (std.mem.startsWith(u8, name, "tabs-that-look-like-indentation/")) return true;
-    if (std.mem.startsWith(u8, name, "tag-shorthand-used-in-documents-")) return true;
-    return false;
-}
+const suite_dir = "yaml-test-suite";
 
 fn readFile(allocator: Allocator, dir: std.fs.Dir, name: []const u8) ?[]u8 {
     const file = dir.openFile(name, .{}) catch return null;
@@ -77,56 +20,84 @@ fn hasFile(dir: std.fs.Dir, name: []const u8) bool {
     return true;
 }
 
+fn readTestName(allocator: Allocator, dir: std.fs.Dir) []const u8 {
+    const raw = readFile(allocator, dir, "===") orelse return "???";
+    defer allocator.free(raw);
+    const trimmed = std.mem.trimRight(u8, raw, "\n\r ");
+    return allocator.dupe(u8, trimmed) catch "???";
+}
+
 const SuiteResult = struct {
     total: u32 = 0,
     passed: u32 = 0,
     failed: u32 = 0,
-    skipped: u32 = 0,
     errors: u32 = 0,
 };
 
-fn runSuiteCase(
+fn runCase(
     allocator: Allocator,
     base_dir: std.fs.Dir,
-    name: []const u8,
+    id: []const u8,
     result: *SuiteResult,
 ) void {
-    result.total += 1;
+    var case_dir = base_dir.openDir(id, .{ .iterate = true }) catch {
+        result.total += 1;
+        result.errors += 1;
+        std.debug.print("  ERROR {s}: cannot open directory\n", .{id});
+        return;
+    };
+    defer case_dir.close();
 
-    if (isKnownFailure(name)) {
-        result.skipped += 1;
+    // If there is no in.yaml, recurse into numbered subdirectories.
+    if (!hasFile(case_dir, "in.yaml")) {
+        var sub_it = case_dir.iterate();
+        while (sub_it.next() catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            var sub_id_buf: [16]u8 = undefined;
+            const sub_id = std.fmt.bufPrint(
+                &sub_id_buf,
+                "{s}/{s}",
+                .{ id, entry.name },
+            ) catch continue;
+            runCase(allocator, base_dir, sub_id, result);
+        }
         return;
     }
 
-    const case_dir = base_dir.openDir(name, .{}) catch {
-        result.errors += 1;
-        return;
-    };
+    result.total += 1;
+
+    const test_name = readTestName(allocator, case_dir);
+    defer if (!std.mem.eql(u8, test_name, "???")) allocator.free(test_name);
 
     const in_yaml = readFile(allocator, case_dir, "in.yaml") orelse {
         result.errors += 1;
+        std.debug.print("  ERROR {s} ({s}): cannot read in.yaml\n", .{ id, test_name });
         return;
     };
     defer allocator.free(in_yaml);
 
     const expects_error = hasFile(case_dir, "error");
 
-    if (expects_error) {
-        var doc = yaml.parse(allocator, in_yaml) catch {
-            result.passed += 1;
-            return;
-        };
+    const ok = if (expects_error) blk: {
+        var doc = yaml.parse(allocator, in_yaml) catch break :blk true;
         doc.deinit();
-        result.failed += 1;
-        return;
-    }
-
-    var doc = yaml.parse(allocator, in_yaml) catch {
-        result.failed += 1;
-        return;
+        break :blk false;
+    } else blk: {
+        var doc = yaml.parse(allocator, in_yaml) catch break :blk false;
+        doc.deinit();
+        break :blk true;
     };
-    doc.deinit();
-    result.passed += 1;
+
+    if (ok) {
+        result.passed += 1;
+    } else {
+        result.failed += 1;
+        if (expects_error) {
+            std.debug.print("  FAIL {s} ({s}): expected error but parsed OK\n", .{ id, test_name });
+        } else {
+            std.debug.print("  FAIL {s} ({s}): parse error on valid YAML\n", .{ id, test_name });
+        }
+    }
 }
 
 test "yaml test suite" {
@@ -145,6 +116,7 @@ test "yaml test suite" {
     var it = base_dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, "name")) continue;
         if (count >= name_buf.len) break;
         name_buf[count] = try allocator.dupe(u8, entry.name);
         count += 1;
@@ -159,22 +131,15 @@ test "yaml test suite" {
     }.cmp);
 
     for (names) |name| {
-        runSuiteCase(allocator, base_dir, name, &result);
+        runCase(allocator, base_dir, name, &result);
     }
 
     std.debug.print(
-        \\
-        \\YAML Test Suite: total={d} passed={d} failed={d} skipped={d} errors={d}
-        \\
-    , .{
-        result.total,
-        result.passed,
-        result.failed,
-        result.skipped,
-        result.errors,
-    });
+        "\nYAML Test Suite: {d}/{d} passed, {d} failed, {d} errors\n",
+        .{ result.passed, result.total, result.failed, result.errors },
+    );
 
-    if (result.errors > 0) {
+    if (result.failed > 0 or result.errors > 0) {
         return error.TestUnexpectedResult;
     }
 }
