@@ -25,6 +25,9 @@ pub const Scanner = struct {
     token_offset: u32 = 0,
     token_indent: u32 = 0,
     last_key_indent: u32 = 0,
+    tag_directives: std.StringHashMapUnmanaged([]const u8) = .empty,
+    pending_tag_directives: std.StringHashMapUnmanaged([]const u8) = .empty,
+    has_pending_tags: bool = false,
 
     pub fn init(allocator: Allocator, source: []const u8) Scanner {
         const arena = std.heap.ArenaAllocator.init(allocator);
@@ -65,6 +68,7 @@ pub const Scanner = struct {
             } else if (c == '-' and self.column == 0 and self.matchDocMarker("---")) {
                 // Document markers are invalid inside flow collections.
                 if (self.flow_level > 0) return error.SyntaxError;
+                self.activateTagDirectives();
                 try self.addToken(.document_header, "---");
                 self.advance(3);
                 self.skipInlineWhitespace();
@@ -388,29 +392,56 @@ pub const Scanner = struct {
             self.advance(1);
         }
         const text = self.source[start..self.pos];
-        // Validate %YAML directive has no extra words after version.
-        if (text.len >= 5 and std.mem.eql(u8, text[0..5], "%YAML") and
+        if (text.len >= 4 and std.mem.eql(u8, text[0..4], "%TAG") and
+            (text.len == 4 or isWhitespace(text[4])))
+        {
+            try self.registerTagDirective(text);
+        } else if (text.len >= 5 and std.mem.eql(u8, text[0..5], "%YAML") and
             (text.len == 5 or isWhitespace(text[5])))
         {
-            var i: usize = 5;
-            while (i < text.len and isWhitespace(text[i])) i += 1;
-            const ver_start = i;
-            // Stop version at whitespace or '#'.
-            while (i < text.len and !isWhitespace(text[i]) and text[i] != '#') i += 1;
-            const ver = text[ver_start..i];
-            if (ver.len == 0) return error.SyntaxError;
-            // Version must contain only digits and dots.
-            for (ver) |vc| {
-                if (vc != '.' and !std.ascii.isDigit(vc)) return error.SyntaxError;
-            }
-            const after_ver = i;
-            while (i < text.len and isWhitespace(text[i])) i += 1;
-            // '#' must be preceded by whitespace to start a comment.
-            if (i < text.len and text[i] == '#' and i == after_ver)
-                return error.SyntaxError;
-            if (i < text.len and text[i] != '#') return error.SyntaxError;
+            try self.validateYamlDirective(text);
         }
         try self.addToken(.directive, text);
+    }
+
+    fn validateYamlDirective(self: *Scanner, text: []const u8) !void {
+        _ = self;
+        var i: usize = 5;
+        while (i < text.len and isWhitespace(text[i])) i += 1;
+        const ver_start = i;
+        while (i < text.len and !isWhitespace(text[i]) and text[i] != '#') i += 1;
+        const ver = text[ver_start..i];
+        if (ver.len == 0) return error.SyntaxError;
+        for (ver) |vc| {
+            if (vc != '.' and !std.ascii.isDigit(vc)) return error.SyntaxError;
+        }
+        const after_ver = i;
+        while (i < text.len and isWhitespace(text[i])) i += 1;
+        if (i < text.len and text[i] == '#' and i == after_ver)
+            return error.SyntaxError;
+        if (i < text.len and text[i] != '#') return error.SyntaxError;
+    }
+
+    fn registerTagDirective(self: *Scanner, text: []const u8) !void {
+        var i: usize = 4;
+        while (i < text.len and isWhitespace(text[i])) i += 1;
+        if (i >= text.len or text[i] != '!') return error.SyntaxError;
+        const handle_start = i;
+        i += 1;
+        // Named handles: !name! — scan until second '!'.
+        if (i < text.len and text[i] != ' ') {
+            while (i < text.len and text[i] != '!') i += 1;
+            if (i >= text.len) return error.SyntaxError;
+            i += 1; // consume closing '!'.
+        }
+        const handle = text[handle_start..i];
+        while (i < text.len and isWhitespace(text[i])) i += 1;
+        if (i >= text.len) return error.SyntaxError;
+        const prefix_start = i;
+        while (i < text.len and !isWhitespace(text[i])) i += 1;
+        const prefix = text[prefix_start..i];
+        try self.pending_tag_directives.put(self.a(), handle, prefix);
+        self.has_pending_tags = true;
     }
 
     fn scanComment(self: *Scanner) !void {
@@ -823,7 +854,33 @@ pub const Scanner = struct {
                 !isFlowIndicator(self.source[self.pos]))
                 self.advance(1);
         }
-        try self.addToken(.tag, self.source[start..self.pos]);
+        const tag = self.source[start..self.pos];
+        try self.validateTagHandle(tag);
+        try self.addToken(.tag, tag);
+    }
+
+    fn activateTagDirectives(self: *Scanner) void {
+        if (self.has_pending_tags) {
+            self.tag_directives = self.pending_tag_directives;
+            self.pending_tag_directives = .empty;
+            self.has_pending_tags = false;
+        } else {
+            self.tag_directives.clearRetainingCapacity();
+        }
+    }
+
+    fn validateTagHandle(self: *Scanner, tag: []const u8) !void {
+        // Extract the handle portion from the tag.
+        // Verbatim (!<...>) and primary (! alone or !suffix) need no directive.
+        if (tag.len < 2) return;
+        if (tag[1] == '<') return;
+        // Find second '!' for named handles like !name!suffix.
+        if (std.mem.indexOfScalar(u8, tag[1..], '!')) |second| {
+            const handle = tag[0 .. second + 2];
+            // !! is the default secondary handle, always valid.
+            if (std.mem.eql(u8, handle, "!!")) return;
+            if (!self.tag_directives.contains(handle)) return error.SyntaxError;
+        }
     }
 
     fn scanPlainScalar(self: *Scanner) !void {
