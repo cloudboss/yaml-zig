@@ -194,12 +194,14 @@ test "dash value after colon returns error" {
     try testing.expectError(error.SyntaxError, yaml.parse(testing.allocator, "a: - 1\nb: - 2\n"));
 }
 
-test "flow map as key returns error" {
-    try testing.expectError(error.SyntaxError, yaml.parse(testing.allocator, "{a: b}: v"));
+test "flow map as key parses" {
+    var doc = try yaml.parse(testing.allocator, "{a: b}: v");
+    doc.deinit();
 }
 
-test "flow seq as key returns error" {
-    try testing.expectError(error.SyntaxError, yaml.parse(testing.allocator, "[a]: v"));
+test "flow seq as key parses" {
+    var doc = try yaml.parse(testing.allocator, "[a]: v");
+    doc.deinit();
 }
 
 test "invalid flow map content returns error" {

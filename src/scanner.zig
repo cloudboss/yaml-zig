@@ -18,6 +18,7 @@ pub const Scanner = struct {
     flow_level: u32,
     tokens: std.ArrayListUnmanaged(Token),
     line_indent: u32 = 0,
+    flow_indent: u32 = 0,
     at_line_start: bool = true,
     token_line: u32 = 1,
     token_column: u32 = 0,
@@ -91,6 +92,7 @@ pub const Scanner = struct {
             } else if (c == '"') {
                 try self.scanDoubleQuoted();
             } else if (c == '{') {
+                if (self.flow_level == 0) self.setFlowIndent();
                 self.flow_level += 1;
                 try self.addToken(.mapping_start, "{");
                 self.advance(1);
@@ -99,6 +101,7 @@ pub const Scanner = struct {
                 try self.addToken(.mapping_end, "}");
                 self.advance(1);
             } else if (c == '[') {
+                if (self.flow_level == 0) self.setFlowIndent();
                 self.flow_level += 1;
                 try self.addToken(.sequence_start, "[");
                 self.advance(1);
@@ -275,10 +278,28 @@ pub const Scanner = struct {
                 }
                 self.advance(1);
             } else {
+                // In flow context, reject content that is not indented
+                // past the block indent where the flow started.
+                if (self.at_line_start and self.flow_level > 0 and
+                    self.line_indent < self.flow_indent and
+                    c != ']' and c != '}')
+                {
+                    return error.SyntaxError;
+                }
                 self.at_line_start = false;
                 break;
             }
         }
+    }
+
+    /// Set the minimum indent for flow content. If the flow indicator
+    /// is the first token on its line, content may be at the same indent.
+    /// Otherwise, content must be indented past the current block indent.
+    fn setFlowIndent(self: *Scanner) void {
+        if (self.column == self.line_indent)
+            self.flow_indent = self.line_indent
+        else
+            self.flow_indent = self.line_indent + 1;
     }
 
     fn skipInlineWhitespace(self: *Scanner) void {
@@ -338,9 +359,17 @@ pub const Scanner = struct {
         if (self.flow_level > 0) {
             if (self.pos + 1 >= self.source.len) return true;
             const next = self.source[self.pos + 1];
-            return next != ':' and (isWhitespace(next) or isNewline(next) or
+            const standard = next != ':' and (isWhitespace(next) or isNewline(next) or
                 isFlowIndicator(next) or next == '"' or next == '\'' or
                 next == '!' or next == '&' or next == '*');
+            if (standard) return true;
+            // JSON-like keys: ':' after quote/flow-end is a value indicator.
+            if (self.pos > 0) {
+                const prev = self.source[self.pos - 1];
+                if (prev == '"' or prev == '\'' or prev == ']' or prev == '}')
+                    return true;
+            }
+            return false;
         }
         if (self.pos + 1 >= self.source.len) return true;
         const next = self.source[self.pos + 1];
@@ -374,7 +403,11 @@ pub const Scanner = struct {
             for (ver) |vc| {
                 if (vc != '.' and !std.ascii.isDigit(vc)) return error.SyntaxError;
             }
+            const after_ver = i;
             while (i < text.len and isWhitespace(text[i])) i += 1;
+            // '#' must be preceded by whitespace to start a comment.
+            if (i < text.len and text[i] == '#' and i == after_ver)
+                return error.SyntaxError;
             if (i < text.len and text[i] != '#') return error.SyntaxError;
         }
         try self.addToken(.directive, text);

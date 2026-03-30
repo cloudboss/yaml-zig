@@ -62,11 +62,17 @@ pub const Parser = struct {
             }
         }
         // Handle document header.
+        var doc_header_line: ?u32 = null;
         if (self.pos < self.tokens.len and
             self.current().token_type == .document_header)
         {
+            doc_header_line = self.current().position.line;
             self.advance();
             self.skipComments();
+            // Reject block mapping content on the same line as '---'.
+            if (self.pos < self.tokens.len) {
+                try self.rejectMappingOnDocLine(doc_header_line.?);
+            }
         }
         if (self.pos >= self.tokens.len) {
             return Node{ .document = .{} };
@@ -192,6 +198,19 @@ pub const Parser = struct {
         return error.SyntaxError;
     }
 
+    /// Reject block mapping content on the same line as a document header.
+    fn rejectMappingOnDocLine(self: *const Parser, doc_line: u32) !void {
+        const tok_line = self.tokens[self.pos].position.line;
+        if (tok_line != doc_line) return;
+        // Scan ahead on this line for a mapping_value ':'.
+        var i = self.pos;
+        while (i < self.tokens.len and self.tokens[i].position.line == doc_line) {
+            if (self.tokens[i].token_type == .mapping_value)
+                return error.SyntaxError;
+            i += 1;
+        }
+    }
+
     fn duplicateKeyError(self: *Parser, msg: []const u8) error{DuplicateKey} {
         var pos: ?Position = null;
         if (self.pos < self.tokens.len) {
@@ -288,9 +307,22 @@ pub const Parser = struct {
         // Document end or next document header stops parsing.
         if (tt == .document_end or tt == .document_header) return null;
 
+        // In block context, content must meet the minimum indent.
+        if (!in_flow and min_indent > 0 and tok.position.column < min_indent and
+            tt != .sequence_entry)
+        {
+            return null;
+        }
+
         // Flow collections.
-        if (tt == .mapping_start) return try self.parseFlowMapping();
-        if (tt == .sequence_start) return try self.parseFlowSequence();
+        if (tt == .mapping_start) {
+            const flow_node = try self.parseFlowMapping();
+            return try self.promoteFlowToMapping(flow_node, min_indent, in_flow);
+        }
+        if (tt == .sequence_start) {
+            const flow_node = try self.parseFlowSequence();
+            return try self.promoteFlowToMapping(flow_node, min_indent, in_flow);
+        }
 
         // Unexpected close brackets.
         if (tt == .mapping_end or tt == .sequence_end) {
@@ -364,6 +396,37 @@ pub const Parser = struct {
         return null;
     }
 
+    // Check if a flow collection node is followed by ':' making it a
+    // mapping key. In flow context, return as-is (handled by caller).
+    fn promoteFlowToMapping(
+        self: *Parser,
+        flow_node: *Node,
+        min_indent: u32,
+        in_flow: bool,
+    ) ParseErr!*Node {
+        if (in_flow) return flow_node;
+        if (!self.peekThroughComments(.mapping_value)) return flow_node;
+        const flow_tok = flow_node.getToken();
+        const mv_line = self.peekMappingValueLine();
+        const start_line = if (flow_tok) |t| t.position.line else mv_line;
+        // Implicit flow keys cannot span multiple lines. Reject unless
+        // we are inside an explicit key context (where '?' already
+        // marks the key boundary).
+        if (mv_line != start_line and self.explicit_key_col == null)
+            return self.syntaxError("multiline flow key");
+        // Inside an explicit key, the ':' is the value separator
+        // handled by the caller; do not promote here.
+        if (self.explicit_key_col != null) return flow_node;
+        const key_col = if (flow_tok) |t| t.position.column else self.currentColumn();
+        const key_indent = if (flow_tok) |t| t.position.indent_num
+            else self.currentIndent();
+        const pre_comment = try self.collectComments();
+        const mv_node = try self.parseMappingValue(
+            flow_node, key_col, key_indent, false, pre_comment, min_indent
+        );
+        return try self.tryExpandToMapping(mv_node, key_col, min_indent);
+    }
+
     // Check if a node (anchor, tag, alias) is followed by ':' making it a
     // mapping key. Build a mapping_value and potentially a full mapping.
     fn promoteToMapping(
@@ -430,7 +493,12 @@ pub const Parser = struct {
         }
 
         // Peek through comments to check for mapping_value ':'.
-        if (self.peekThroughComments(.mapping_value)) {
+        // In block context, implicit keys must be on one line; only
+        // consume ':' if it is on the same line as the key.
+        const key_line = if (key_node.getToken()) |kt| kt.position.line else 0;
+        if (self.peekThroughComments(.mapping_value) and
+            (in_flow or self.peekMappingValueLine() == key_line))
+        {
             const pre_comment = try self.collectComments();
             const mv_node = try self.parseMappingValue(
                 key_node,
@@ -455,27 +523,8 @@ pub const Parser = struct {
                 }
             }
 
-            // Check for sibling key-value pairs at the same column.
-            self.skipComments();
-            if (!in_flow and self.pos < self.tokens.len) {
-                const next = self.current();
-                if (self.isKeyToken(next.token_type) and
-                    next.position.column == key_col and
-                    key_col >= min_indent)
-                {
-                    if (self.peekForMappingValue(next.position.column)) {
-                        const mv = mv_node.*.mapping_value;
-                        return try self.parseMappingWithFirst(
-                            key_node,
-                            mv.value.?,
-                            key_col,
-                            min_indent,
-                            mv.node_comment,
-                        );
-                    }
-                }
-            }
-            return mv_node;
+            // Try to expand into a full mapping with siblings.
+            return try self.tryExpandToMapping(mv_node, key_col, min_indent);
         }
 
         // Don't skip comments here, leave them for the caller to collect
@@ -510,6 +559,27 @@ pub const Parser = struct {
         return i;
     }
 
+    /// Check if a quoted scalar token starting at key_line has its value
+    /// separator on a different line (multiline implicit key, invalid).
+    fn isQuotedMultilineKey(
+        self: *const Parser,
+        tt: TokenType,
+        key_line: u32,
+    ) bool {
+        if (tt != .single_quote and tt != .double_quote) return false;
+        return self.peekMappingValueLine() != key_line;
+    }
+
+    /// Return the line of the next mapping_value token, skipping comments.
+    fn peekMappingValueLine(self: *const Parser) u32 {
+        var i = self.pos;
+        while (i < self.tokens.len and self.tokens[i].token_type == .comment)
+            i += 1;
+        if (i < self.tokens.len and self.tokens[i].token_type == .mapping_value)
+            return self.tokens[i].position.line;
+        return 0;
+    }
+
     fn peekThroughComments(self: *const Parser, expected: TokenType) bool {
         var i = self.pos;
         while (i < self.tokens.len and self.tokens[i].token_type == .comment) {
@@ -518,21 +588,31 @@ pub const Parser = struct {
         return i < self.tokens.len and self.tokens[i].token_type == expected;
     }
 
-    // Scan ahead on the same line through anchors, tags, scalars, and
-    // comments to find a mapping_value token.
+    // Scan ahead on the same line through anchors, tags, scalars, flow
+    // collections, and comments to find a mapping_value token.
     fn hasMappingValueAhead(self: *const Parser) bool {
         if (self.pos >= self.tokens.len) return false;
         const start_line = self.tokens[self.pos].position.line;
         var i = self.pos;
+        var depth: u32 = 0;
         while (i < self.tokens.len) {
-            if (self.tokens[i].position.line != start_line) break;
+            if (self.tokens[i].position.line != start_line and depth == 0) break;
             const tt = self.tokens[i].token_type;
-            if (tt == .mapping_value) return true;
-            if (tt == .comment or tt == .anchor or tt == .alias or tt == .tag) {
+            if (tt == .mapping_value and depth == 0) return true;
+            if (tt == .mapping_start or tt == .sequence_start) {
+                depth += 1;
                 i += 1;
                 continue;
             }
-            if (self.isScalarToken(tt)) {
+            if (tt == .mapping_end or tt == .sequence_end) {
+                if (depth > 0) depth -= 1;
+                i += 1;
+                continue;
+            }
+            if (depth > 0 or tt == .comment or tt == .anchor or
+                tt == .alias or tt == .tag or tt == .collect_entry or
+                self.isScalarToken(tt))
+            {
                 i += 1;
                 continue;
             }
@@ -626,7 +706,11 @@ pub const Parser = struct {
                 key_col, key_indent, min_indent
             ),
             .merge_key => try self.parseMergeKeyValue(key_col + 1, false),
-            .mapping_key => try self.parseExplicitKey(key_col + 1, false),
+            .mapping_key => blk: {
+                const q_col = val_tok.position.column;
+                const ek = try self.parseExplicitKey(key_col + 1, false);
+                break :blk try self.tryExpandToMapping(ek, q_col, key_col + 1);
+            },
             .document_header, .document_end => null,
             else => if (self.isScalarToken(val_tt))
                 try self.parseValueScalar(val_indent, val_line, key_col, key_indent)
@@ -821,7 +905,11 @@ pub const Parser = struct {
             const entry_comment = try self.collectComments();
             if (self.pos >= self.tokens.len) break;
 
-            const entry = try self.parseMappingEntry(min_indent) orelse break;
+            const saved_pos = self.pos;
+            const entry = try self.parseMappingEntry(min_indent) orelse {
+                self.pos = saved_pos; // Restore if entry consumed tokens without result.
+                break;
+            };
 
             const ks = self.nodeKeyString(entry.key);
             if (ks) |k| {
@@ -911,11 +999,16 @@ pub const Parser = struct {
                 node = tag;
             }
         } else {
+            const key_tt = self.current().token_type;
+            const key_start_line = self.current().position.line;
             const key = try self.parseScalarValue();
             self.skipComments();
             if (self.pos < self.tokens.len and
                 self.tokens[self.pos].token_type == .mapping_value)
             {
+                // Reject multiline quoted implicit keys.
+                if (self.isQuotedMultilineKey(key_tt, key_start_line))
+                    return self.syntaxError("multiline quoted key");
                 node = try self.parseMappingValue(
                     key,
                     col,
@@ -947,7 +1040,7 @@ pub const Parser = struct {
                 break :blk null;
             },
             .boolean => |b| if (b.value) "true" else "false",
-            .null_value => "null",
+            .null_value => |nv| if (nv.token != null) "null" else null,
             .merge_key => "<<",
             else => null,
         };
@@ -1021,6 +1114,7 @@ pub const Parser = struct {
     }
 
     fn parseFlowMapping(self: *Parser) ParseErr!*Node {
+        const open_tok = &self.tokens[self.pos];
         self.advance(); // Consume '{'.
         var entries = std.ArrayListUnmanaged(*const ast.MappingValueNode){};
 
@@ -1067,7 +1161,7 @@ pub const Parser = struct {
             } else if (tok.token_type == .mapping_start or
                 tok.token_type == .sequence_start)
             {
-                return self.syntaxError("flow collection as key");
+                key_node = try self.parseNode(0, true);
             } else {
                 return self.syntaxError("unexpected token in flow mapping");
             }
@@ -1122,6 +1216,7 @@ pub const Parser = struct {
         }
 
         const mapping = try self.createNode(Node{ .mapping = .{
+            .token = open_tok,
             .values = try self.dupeSlice(*const ast.MappingValueNode, entries.items),
             .is_flow = true,
         } });
@@ -1129,6 +1224,7 @@ pub const Parser = struct {
     }
 
     fn parseFlowSequence(self: *Parser) ParseErr!*Node {
+        const open_tok = &self.tokens[self.pos];
         self.advance(); // Consume '['.
         var items = std.ArrayListUnmanaged(*const Node){};
 
@@ -1180,9 +1276,11 @@ pub const Parser = struct {
             if (item) |node| {
                 // Check if this scalar is followed by ':' (inline mapping).
                 self.skipComments();
+                const node_line = if (node.getToken()) |nt| nt.position.line else 0;
                 if (self.pos < self.tokens.len and
                     self.tokens[self.pos].token_type == .mapping_value and
-                    node.* != .mapping_value)
+                    node.* != .mapping_value and
+                    self.tokens[self.pos].position.line == node_line)
                 {
                     // This is an inline mapping entry in a flow sequence.
                     self.advance(); // Consume ':'.
@@ -1227,6 +1325,7 @@ pub const Parser = struct {
         }
 
         const seq = try self.createNode(Node{ .sequence = .{
+            .token = open_tok,
             .values = try self.dupeSlice(*const Node, items.items),
             .is_flow = true,
         } });
@@ -1405,6 +1504,11 @@ pub const Parser = struct {
                 if (in_flow or next.position.line == anchor_line) {
                     value_node = try self.parseTag(min_indent, in_flow);
                 }
+            } else if (next.token_type == .alias and
+                next.position.line == anchor_line)
+            {
+                // Anchor on an alias is invalid (aliases are references).
+                return self.syntaxError("anchor on alias");
             } else if (self.isScalarToken(next.token_type)) {
                 // Parse just the scalar. The caller handles ':' promotion.
                 if (in_flow or next.position.line == anchor_line) {
@@ -1413,6 +1517,9 @@ pub const Parser = struct {
             } else if (next.token_type == .literal or next.token_type == .folded) {
                 value_node = try self.parseBlockScalar();
             } else if (next.token_type == .sequence_entry) {
+                // Anchor on same line as '-' is invalid.
+                if (next.position.line == anchor_line)
+                    return self.syntaxError("anchor before sequence entry");
                 // Only parse if the sequence entry meets the indent threshold.
                 if (next.position.column >= min_indent) {
                     value_node = try self.parseBlockSequence(min_indent);
@@ -4413,14 +4520,20 @@ test "parse syntax error reserved backtick" {
     try testing.expectError(error.SyntaxError, doc);
 }
 
-test "parse syntax error flow map as key" {
-    const doc = testParse("{a: b}: v");
-    try testing.expectError(error.SyntaxError, doc);
+test "parse flow map as key" {
+    var doc = try testParse("{a: b}: v");
+    defer doc.deinit();
+    const mv = try expectMappingValue(doc.body.?);
+    try testing.expect(mv.key != null);
+    try testing.expect(mv.value != null);
 }
 
-test "parse syntax error flow seq as key" {
-    const doc = testParse("[a]: v");
-    try testing.expectError(error.SyntaxError, doc);
+test "parse flow seq as key" {
+    var doc = try testParse("[a]: v");
+    defer doc.deinit();
+    const mv = try expectMappingValue(doc.body.?);
+    try testing.expect(mv.key != null);
+    try testing.expect(mv.value != null);
 }
 
 test "parse syntax error duplicate key top" {
