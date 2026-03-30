@@ -23,6 +23,7 @@ pub const Parser = struct {
     tokens: []const Token = &.{},
     pos: usize = 0,
     last_error: ?Detail = null,
+    explicit_key_col: ?u32 = null,
 
     pub fn init(allocator: Allocator) Parser {
         return .{ .allocator = allocator };
@@ -50,19 +51,14 @@ pub const Parser = struct {
             }
             self.advance();
             self.skipComments();
-            // After directive, expect document header or end.
+            // After directive, expect document header.
             if (self.pos < self.tokens.len and
                 self.current().token_type == .document_header)
             {
                 self.advance();
                 self.skipComments();
-            } else if (self.pos < self.tokens.len and
-                self.isContentToken(self.current().token_type))
-            {
+            } else {
                 return self.syntaxError("expected document header after directive");
-            }
-            if (self.pos >= self.tokens.len) {
-                return Node{ .document = .{} };
             }
         }
         // Handle document header.
@@ -330,7 +326,13 @@ pub const Parser = struct {
         }
 
         // Mapping key (explicit `?`).
-        if (tt == .mapping_key) return try self.parseExplicitKey(min_indent, in_flow);
+        if (tt == .mapping_key) {
+            const q_col = tok.position.column;
+            const ek = try self.parseExplicitKey(min_indent, in_flow);
+            if (!in_flow)
+                return try self.tryExpandToMapping(ek, q_col, min_indent);
+            return ek;
+        }
 
         // Block scalar.
         if (tt == .literal or tt == .folded) {
@@ -347,9 +349,13 @@ pub const Parser = struct {
             return try self.parseScalarOrMapping(min_indent, in_flow);
         }
 
-        // Bare mapping_value ':' without a key is a syntax error at non-flow level.
+        // Bare ':' without key creates null-key mapping.
         if (tt == .mapping_value and !in_flow) {
-            return self.syntaxError("unexpected ':'");
+            const null_key = try self.createNode(Node{ .null_value = .{} });
+            const kc = self.currentColumn();
+            const ki = self.currentIndent();
+            const mv = try self.parseMappingValue(null_key, kc, ki, false, null, min_indent);
+            return try self.tryExpandToMapping(mv, kc, min_indent);
         }
 
         // Collect entry and mapping_value are handled by callers.
@@ -370,37 +376,36 @@ pub const Parser = struct {
         const key_tok = key_node.getToken() orelse return key_node;
         const key_col = key_tok.position.column;
         const key_indent = key_tok.position.indent_num;
-        // Peek for ':' without consuming comments.
         if (!self.peekThroughComments(.mapping_value)) return key_node;
         const pre_comment = try self.collectComments();
         const mv_node = try self.parseMappingValue(
-            key_node,
-            key_col,
-            key_indent,
-            false,
-            pre_comment,
-            min_indent,
+            key_node, key_col, key_indent, false, pre_comment, min_indent
         );
-        // Check for sibling key-value pairs at the same column.
+        return try self.tryExpandToMapping(mv_node, key_col, min_indent);
+    }
+
+    // Check if a mapping_value node has sibling entries at the same column,
+    // and if so, expand into a full mapping node.
+    fn tryExpandToMapping(
+        self: *Parser,
+        mv_node: *Node,
+        key_col: u32,
+        min_indent: u32,
+    ) ParseErr!*Node {
         self.skipComments();
-        if (self.pos < self.tokens.len) {
-            const next = self.current();
-            if (self.isKeyToken(next.token_type) and
-                next.position.column == key_col and key_col >= min_indent)
-            {
-                if (self.peekForMappingValue(next.position.column)) {
-                    const mv = mv_node.*.mapping_value;
-                    return try self.parseMappingWithFirst(
-                        key_node,
-                        mv.value.?,
-                        key_col,
-                        min_indent,
-                        mv.node_comment,
-                    );
-                }
-            }
-        }
-        return mv_node;
+        if (self.pos >= self.tokens.len) return mv_node;
+        const next = self.current();
+        const is_sibling = (self.isKeyToken(next.token_type) or
+            next.token_type == .mapping_key or next.token_type == .mapping_value) and
+            next.position.column == key_col and key_col >= min_indent;
+        if (!is_sibling) return mv_node;
+        if (next.token_type != .mapping_value and
+            next.token_type != .mapping_key and
+            !self.peekForMappingValue(next.position.column)) return mv_node;
+        const mv = mv_node.*.mapping_value;
+        const fk = mv.key orelse try self.createNode(Node{ .null_value = .{} });
+        const fv = mv.value orelse try self.createNode(Node{ .null_value = .{} });
+        return try self.parseMappingWithFirst(fk, fv, key_col, min_indent, mv.node_comment);
     }
 
     fn parseScalarOrMapping(self: *Parser, min_indent: u32, in_flow: bool) ParseErr!?*Node {
@@ -408,11 +413,23 @@ pub const Parser = struct {
         const key_indent = self.currentIndent();
         const key_node = try self.parseScalarValue();
 
-        // In flow context, don't consume ':' here, let the flow collection handle it.
+        // In flow context, don't consume ':' here.
         if (in_flow) return key_node;
 
+        // In explicit key context, skip ':' at the '?' column (the
+        // value separator) but allow ':' at other columns (nested
+        // mappings like "? earth: blue").
+        if (self.explicit_key_col) |ekc| {
+            const mv_pos = self.skipCommentsPos();
+            if (mv_pos < self.tokens.len and
+                self.tokens[mv_pos].token_type == .mapping_value and
+                self.tokens[mv_pos].position.column == ekc)
+            {
+                return key_node;
+            }
+        }
+
         // Peek through comments to check for mapping_value ':'.
-        // Don't consume comments yet, parseMappingValue will handle them.
         if (self.peekThroughComments(.mapping_value)) {
             const pre_comment = try self.collectComments();
             const mv_node = try self.parseMappingValue(
@@ -423,6 +440,20 @@ pub const Parser = struct {
                 pre_comment,
                 min_indent,
             );
+
+            // Reject nested implicit mapping on same line (e.g., "a: b: c").
+            const key_tok = key_node.getToken();
+            if (key_tok != null and mv_node.* == .mapping_value) {
+                const kl = key_tok.?.position.line;
+                const mv = mv_node.mapping_value;
+                if (mv.value) |val| {
+                    if (val.* == .mapping_value) {
+                        const nt = val.mapping_value.key.?.getToken();
+                        if (nt != null and nt.?.position.line == kl)
+                            return self.syntaxError("nested mapping on same line");
+                    }
+                }
+            }
 
             // Check for sibling key-value pairs at the same column.
             self.skipComments();
@@ -537,103 +568,164 @@ pub const Parser = struct {
         pre_comment: ?*const ast.CommentGroupNode,
         min_indent: u32,
     ) ParseErr!*Node {
-        // Save colon position for validation.
         const colon_line = self.current().position.line;
-        // Consume the ':'
         self.advance();
 
-        // Collect inline comment after ':'.
         var inline_comment = try self.collectInlineComment();
-
         self.skipComments();
 
-        // Parse the value.
-        var value_node: ?*Node = null;
-        if (self.pos < self.tokens.len) {
-            const val_tok = self.current();
-            const val_tt = val_tok.token_type;
-            if (in_flow) {
-                if (val_tt != .mapping_end and val_tt != .collect_entry and
-                    val_tt != .sequence_end)
-                {
-                    value_node = try self.parseNode(0, true);
-                }
-            } else if (val_tt == .sequence_entry) {
-                const seq_indent = val_tok.position.indent_num;
-                // Sequence entry on same line as ':' is a syntax error,
-                // e.g., "a: -" or "a: - 1".
-                if (val_tok.position.line == colon_line) {
-                    return self.syntaxError("unexpected sequence entry after ':'");
-                }
-                if (seq_indent <= key_indent and seq_indent >= min_indent) {
-                    value_node = try self.parseBlockSequence(min_indent);
-                } else if (seq_indent > key_indent) {
-                    value_node = try self.parseBlockSequence(key_col + 1);
-                }
-            } else if (val_tt == .literal or val_tt == .folded) {
-                value_node = try self.parseBlockScalar();
-            } else if (val_tt == .mapping_start) {
-                value_node = try self.parseFlowMapping();
-            } else if (val_tt == .sequence_start) {
-                value_node = try self.parseFlowSequence();
-            } else if (val_tt == .anchor or val_tt == .alias or val_tt == .tag) {
-                value_node = try self.parseNode(key_col + 1, false);
-            } else if (val_tt == .merge_key) {
-                value_node = try self.parseMergeKeyValue(key_col + 1, false);
-            } else if (self.isScalarToken(val_tt)) {
-                const val_indent = val_tok.position.indent_num;
-                if (val_indent > key_indent or val_indent > key_col or
-                    val_tok.position.line == self.tokens[self.pos -| 1].position.line)
-                {
-                    value_node = try self.parseScalarOrMapping(key_col + 1, false);
-                }
-            } else if (val_tt == .document_header or val_tt == .document_end) {
-                // Empty value.
-            } else if (val_tt == .mapping_key) {
-                value_node = try self.parseExplicitKey(key_col + 1, false);
-            }
-        }
-
+        var value_node = try self.parseMappingValueContent(
+            key_col, key_indent, colon_line, in_flow, min_indent
+        );
         if (value_node == null) {
             value_node = try self.createNode(Node{ .null_value = .{} });
         }
 
-        // Collect post-value inline comment.
         const post_comment = try self.collectInlineComment();
         inline_comment = try self.mergeComments(inline_comment, post_comment);
+        inline_comment = self.liftFlowComment(value_node.?, inline_comment);
 
-        // If the value is a mapping_value with a flow collection value and a comment,
-        // propagate the comment up (for cases like "b: {} # comment").
-        if (value_node != null and inline_comment == null) {
-            switch (value_node.?.*) {
-                .mapping_value => |*mv| {
-                    if (mv.node_comment != null and mv.value != null) {
-                        const val_type: ast.NodeType = mv.value.?.*;
-                        if (val_type == .mapping or val_type == .sequence) {
-                            const inner_val = switch (mv.value.?.*) {
-                                .mapping => |m| m.is_flow,
-                                .sequence => |s| s.is_flow,
-                                else => false,
-                            };
-                            if (inner_val) {
-                                inline_comment = mv.node_comment;
-                                mv.node_comment = null;
-                            }
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
-        const mv_comment = try self.mergeComments(pre_comment, inline_comment);
         const mv = try self.createNode(Node{ .mapping_value = .{
             .token = key_node.getToken(),
             .key = key_node,
             .value = value_node,
-            .node_comment = mv_comment,
+            .node_comment = try self.mergeComments(pre_comment, inline_comment),
         } });
         return mv;
+    }
+
+    fn parseMappingValueContent(
+        self: *Parser,
+        key_col: u32,
+        key_indent: u32,
+        colon_line: u32,
+        in_flow: bool,
+        min_indent: u32,
+    ) ParseErr!?*Node {
+        if (self.pos >= self.tokens.len) return null;
+        const val_tok = self.current();
+        const val_tt = val_tok.token_type;
+
+        if (in_flow) {
+            if (val_tt == .mapping_end or val_tt == .collect_entry or
+                val_tt == .sequence_end) return null;
+            return try self.parseNode(0, true);
+        }
+
+        const val_line = val_tok.position.line;
+        const val_indent = val_tok.position.indent_num;
+
+        return switch (val_tt) {
+            .sequence_entry => try self.parseValueSequence(
+                val_indent, val_line, key_col, key_indent, colon_line, min_indent
+            ),
+            .literal, .folded => try self.parseBlockScalar(),
+            .mapping_start => try self.parseFlowMapping(),
+            .sequence_start => try self.parseFlowSequence(),
+            .anchor, .alias, .tag => try self.parseValueNodeProperty(
+                key_col, key_indent, min_indent
+            ),
+            .merge_key => try self.parseMergeKeyValue(key_col + 1, false),
+            .mapping_key => try self.parseExplicitKey(key_col + 1, false),
+            .document_header, .document_end => null,
+            else => if (self.isScalarToken(val_tt))
+                try self.parseValueScalar(val_indent, val_line, key_col, key_indent)
+            else
+                null,
+        };
+    }
+
+    fn parseValueSequence(
+        self: *Parser,
+        seq_indent: u32,
+        val_line: u32,
+        key_col: u32,
+        key_indent: u32,
+        colon_line: u32,
+        min_indent: u32,
+    ) ParseErr!?*Node {
+        if (val_line == colon_line) {
+            const cc = self.tokens[self.pos -| 1].position.column;
+            if (cc != key_col)
+                return self.syntaxError("unexpected sequence entry after ':'");
+        }
+        if (seq_indent <= key_indent and seq_indent >= min_indent)
+            return try self.parseBlockSequence(min_indent);
+        if (seq_indent > key_indent)
+            return try self.parseBlockSequence(key_col + 1);
+        return null;
+    }
+
+    fn parseValueNodeProperty(
+        self: *Parser,
+        key_col: u32,
+        key_indent: u32,
+        min_indent: u32,
+    ) ParseErr!?*Node {
+        const node = try self.parseNode(key_col + 1, false);
+        if (node == null) return null;
+        // Anchor/tag without value may precede a sequence at key level.
+        if (self.pos < self.tokens.len and
+            self.tokens[self.pos].token_type == .sequence_entry and
+            self.tokens[self.pos].position.indent_num <= key_indent)
+        {
+            const empty = switch (node.?.*) {
+                .anchor => |a| a.value == null,
+                .tag => |t| t.value == null,
+                else => false,
+            };
+            if (empty) {
+                const sq = try self.parseBlockSequence(min_indent);
+                switch (node.?.*) {
+                    .anchor => |*a| a.value = sq,
+                    .tag => |*t| t.value = sq,
+                    else => {},
+                }
+            }
+        }
+        return node;
+    }
+
+    fn parseValueScalar(
+        self: *Parser,
+        val_indent: u32,
+        val_line: u32,
+        key_col: u32,
+        key_indent: u32,
+    ) ParseErr!?*Node {
+        if (val_indent > key_indent or val_indent > key_col or
+            val_line == self.tokens[self.pos -| 1].position.line)
+            return try self.parseScalarOrMapping(key_col + 1, false);
+        return null;
+    }
+
+    // If a mapping_value's value is a flow collection with a comment,
+    // lift the comment up to the mapping_value level.
+    fn liftFlowComment(
+        self: *const Parser,
+        value_node: *Node,
+        current_comment: ?*const ast.CommentGroupNode,
+    ) ?*const ast.CommentGroupNode {
+        _ = self;
+        if (current_comment != null) return current_comment;
+        switch (value_node.*) {
+            .mapping_value => |*mv| {
+                if (mv.node_comment != null and mv.value != null) {
+                    const is_flow = switch (mv.value.?.*) {
+                        .mapping => |m| m.is_flow,
+                        .sequence => |s| s.is_flow,
+                        else => false,
+                    };
+                    if (is_flow) {
+                        const c = mv.node_comment;
+                        mv.node_comment = null;
+                        return c;
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
     }
 
     fn peekForMappingValue(self: *const Parser, col: u32) bool {
@@ -641,6 +733,8 @@ pub const Parser = struct {
         while (i < self.tokens.len) {
             const tt = self.tokens[i].token_type;
             if (tt == .mapping_value) return true;
+            // Explicit '?' implies a mapping value follows.
+            if (tt == .mapping_key and self.tokens[i].position.column == col) return true;
             if (tt == .comment) {
                 i += 1;
                 continue;
@@ -702,10 +796,11 @@ pub const Parser = struct {
             if (tok_col < indent) break;
             if (tok_col != indent) break;
 
-            // Must be a key token.
+            // Must be a key token or bare ':' (null key).
             if (!self.isScalarToken(tok.token_type) and
                 tok.token_type != .merge_key and
                 tok.token_type != .mapping_key and
+                tok.token_type != .mapping_value and
                 tok.token_type != .anchor and
                 tok.token_type != .alias and
                 tok.token_type != .tag)
@@ -713,14 +808,14 @@ pub const Parser = struct {
                 break;
             }
 
-            // Must have a mapping value ahead.
-            if (!self.peekForMappingValue(indent)) {
-                // Could be a bare string at the same indent that's NOT a key.
-                // This is an error: e.g., "a: 1\nb".
-                if (self.isScalarToken(tok.token_type)) {
-                    return self.syntaxError("expected mapping value");
+            // Bare ':' is always valid as null-key entry.
+            if (tok.token_type != .mapping_value) {
+                if (!self.peekForMappingValue(indent)) {
+                    if (self.isScalarToken(tok.token_type)) {
+                        return self.syntaxError("expected mapping value");
+                    }
+                    break;
                 }
-                break;
             }
 
             const entry_comment = try self.collectComments();
@@ -758,7 +853,11 @@ pub const Parser = struct {
         const tt = self.current().token_type;
 
         var node: ?*Node = null;
-        if (tt == .merge_key) {
+        if (tt == .mapping_value) {
+            // Bare ':' entry with null key.
+            const nk = try self.createNode(Node{ .null_value = .{} });
+            node = try self.parseMappingValue(nk, col, ind, false, null, min_indent);
+        } else if (tt == .merge_key) {
             node = try self.parseMergeKeyEntry(min_indent);
         } else if (tt == .mapping_key) {
             node = try self.parseExplicitKey(min_indent, false);
@@ -962,6 +1061,9 @@ pub const Parser = struct {
                 tok.token_type == .null_value)
             {
                 key_node = try self.parseNode(0, true);
+            } else if (tok.token_type == .mapping_value) {
+                // Bare ':' as null key.
+                key_node = null;
             } else if (tok.token_type == .mapping_start or
                 tok.token_type == .sequence_start)
             {
@@ -1044,6 +1146,33 @@ pub const Parser = struct {
 
             if (tok.token_type == .collect_entry) {
                 self.advance();
+                continue;
+            }
+
+            // Bare ':' creates null-key mapping entry.
+            if (tok.token_type == .mapping_value) {
+                self.advance();
+                self.skipComments();
+                var nv: ?*Node = null;
+                if (self.pos < self.tokens.len) {
+                    const vt = self.tokens[self.pos].token_type;
+                    if (vt != .sequence_end and vt != .collect_entry) {
+                        nv = try self.parseNode(0, true);
+                    }
+                }
+                if (nv == null) nv = try self.createNode(Node{ .null_value = .{} });
+                const nk = try self.createNode(Node{ .null_value = .{} });
+                const nmv = try self.createNode(Node{
+                    .mapping_value = .{ .key = nk, .value = nv },
+                });
+                try items.append(self.allocator, nmv);
+                self.skipComments();
+                if (self.pos < self.tokens.len) {
+                    const nt = self.tokens[self.pos].token_type;
+                    if (nt != .sequence_end and nt != .collect_entry) {
+                        return self.syntaxError("expected ',' or ']' in flow sequence");
+                    }
+                }
                 continue;
             }
 
@@ -1304,6 +1433,8 @@ pub const Parser = struct {
                 } else if (next.token_type == .tag) {
                     // Tag on next line is the anchor's value.
                     value_node = try self.parseNode(min_indent, false);
+                } else if (next.token_type == .alias) {
+                    value_node = try self.parseNode(min_indent, false);
                 } else if (next.token_type == .anchor) {
                     // Only consume a nested anchor if it leads to a mapping
                     // (double-anchor on a bare scalar is invalid).
@@ -1431,7 +1562,16 @@ pub const Parser = struct {
         if (self.pos < self.tokens.len and
             self.tokens[self.pos].token_type != .mapping_value)
         {
+            // Track explicit key column so parseScalarOrMapping skips
+            // ':' at this column (the value separator) but still
+            // consumes ':' at other columns (nested mappings).
+            const prev_ekc = self.explicit_key_col;
+            self.explicit_key_col = if (self.pos > 0)
+                self.tokens[self.pos - 1].position.column
+            else
+                @as(u32, 0);
             key_node = try self.parseNode(min_indent, in_flow);
+            self.explicit_key_col = prev_ekc;
         }
 
         self.skipComments();

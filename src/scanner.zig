@@ -62,10 +62,14 @@ pub const Scanner = struct {
             if (c == '%' and self.column == 0) {
                 try self.scanDirective();
             } else if (c == '-' and self.column == 0 and self.matchDocMarker("---")) {
+                // Document markers are invalid inside flow collections.
+                if (self.flow_level > 0) return error.SyntaxError;
                 try self.addToken(.document_header, "---");
                 self.advance(3);
                 self.skipInlineWhitespace();
             } else if (c == '.' and self.column == 0 and self.matchDocMarker("...")) {
+                // Document markers are invalid inside flow collections.
+                if (self.flow_level > 0) return error.SyntaxError;
                 try self.addToken(.document_end, "...");
                 self.advance(3);
                 self.skipInlineWhitespace();
@@ -115,16 +119,19 @@ pub const Scanner = struct {
                 try self.addToken(.collect_entry, ",");
                 self.advance(1);
             } else if (c == '?' and (self.pos + 1 >= self.source.len or
-                isWhitespace(self.source[self.pos + 1])))
+                isWhitespaceOrNewline(self.source[self.pos + 1])))
             {
                 try self.addToken(.mapping_key, "?");
                 self.advance(1);
+                if (self.flow_level == 0) try self.rejectTabAfterIndicator();
             } else if (c == ':' and self.isMappingValue()) {
                 try self.addToken(.mapping_value, ":");
                 self.advance(1);
+                if (self.flow_level == 0) try self.rejectTabAfterIndicator();
             } else if (c == '-' and self.isSequenceEntry()) {
                 try self.addToken(.sequence_entry, "-");
                 self.advance(1);
+                if (self.flow_level == 0) try self.rejectTabAfterIndicator();
             } else if (c == '|' or c == '>') {
                 try self.scanBlockScalar();
             } else if (c == '&') {
@@ -247,7 +254,21 @@ pub const Scanner = struct {
                 self.line_indent = 0;
             } else if (isWhitespace(c)) {
                 if (self.at_line_start and c == '\t' and self.flow_level == 0) {
-                    return error.TabInIndent;
+                    // Tabs are never valid as indentation in block YAML.
+                    // Allow on blank lines, after spaces (separation), and
+                    // before flow indicators/comments at column 0.
+                    var p = self.pos;
+                    while (p < self.source.len and isWhitespace(self.source[p]))
+                        p += 1;
+                    const is_blank = p >= self.source.len or isNewline(self.source[p]);
+                    if (!is_blank and self.line_indent == 0) {
+                        const nc = self.source[p];
+                        if (nc != '{' and nc != '}' and nc != '[' and
+                            nc != ']' and nc != '#')
+                        {
+                            return error.TabInIndent;
+                        }
+                    }
                 }
                 if (self.at_line_start and c == ' ') {
                     self.line_indent += 1;
@@ -263,6 +284,44 @@ pub const Scanner = struct {
     fn skipInlineWhitespace(self: *Scanner) void {
         while (self.pos < self.source.len and isWhitespace(self.source[self.pos])) {
             self.advance(1);
+        }
+    }
+
+    /// Reject a tab after a block indicator when it precedes another
+    /// block indicator or mapping key. Only called in block context.
+    fn rejectTabAfterIndicator(self: *Scanner) !void {
+        var p = self.pos;
+        var has_tab = false;
+        while (p < self.source.len and
+            (self.source[p] == ' ' or self.source[p] == '\t'))
+        {
+            if (self.source[p] == '\t') has_tab = true;
+            p += 1;
+        }
+        if (!has_tab) return;
+        if (p >= self.source.len or isNewline(self.source[p])) return;
+        const nc = self.source[p];
+        // Tab before another block indicator is invalid indentation.
+        if (nc == '-' or nc == '?') {
+            if (p + 1 >= self.source.len or
+                isWhitespaceOrNewline(self.source[p + 1]))
+            {
+                return error.TabInIndent;
+            }
+        }
+        // Tab before a mapping key (text followed by ':') is invalid.
+        if (!isFlowIndicator(nc) and nc != '#') {
+            var q = p;
+            while (q < self.source.len and !isNewline(self.source[q])) {
+                if (self.source[q] == ':') {
+                    if (q + 1 >= self.source.len or
+                        isWhitespaceOrNewline(self.source[q + 1]))
+                    {
+                        return error.TabInIndent;
+                    }
+                }
+                q += 1;
+            }
         }
     }
 
@@ -301,11 +360,20 @@ pub const Scanner = struct {
         }
         const text = self.source[start..self.pos];
         // Validate %YAML directive has no extra words after version.
-        if (text.len >= 5 and std.mem.eql(u8, text[0..5], "%YAML")) {
-            // Skip "%YAML", then whitespace, then version, then check for more.
+        if (text.len >= 5 and std.mem.eql(u8, text[0..5], "%YAML") and
+            (text.len == 5 or isWhitespace(text[5])))
+        {
             var i: usize = 5;
             while (i < text.len and isWhitespace(text[i])) i += 1;
-            while (i < text.len and !isWhitespace(text[i])) i += 1;
+            const ver_start = i;
+            // Stop version at whitespace or '#'.
+            while (i < text.len and !isWhitespace(text[i]) and text[i] != '#') i += 1;
+            const ver = text[ver_start..i];
+            if (ver.len == 0) return error.SyntaxError;
+            // Version must contain only digits and dots.
+            for (ver) |vc| {
+                if (vc != '.' and !std.ascii.isDigit(vc)) return error.SyntaxError;
+            }
             while (i < text.len and isWhitespace(text[i])) i += 1;
             if (i < text.len and text[i] != '#') return error.SyntaxError;
         }
@@ -438,6 +506,8 @@ pub const Scanner = struct {
         const is_literal = self.source[self.pos] == '|';
         const tt: TokenType = if (is_literal) .literal else .folded;
         const header_start = self.pos;
+        // Check if a document header precedes this block scalar.
+        const after_doc_header = self.lastTokenType() == .document_header;
         self.advance(1);
 
         var chomp: enum { clip, strip, keep } = .clip;
@@ -466,13 +536,24 @@ pub const Scanner = struct {
         const header_val = self.source[header_start..self.pos];
         try self.addToken(tt, header_val);
 
+        // A comment after the header requires preceding whitespace.
+        if (self.pos < self.source.len and self.source[self.pos] == '#') {
+            return error.SyntaxError;
+        }
         self.skipInlineWhitespace();
         if (self.pos < self.source.len and self.source[self.pos] == '#') {
             try self.scanComment();
         }
 
+        // Reject non-comment, non-newline content after the header.
+        if (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
+            return error.SyntaxError;
+        }
+
         if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
             self.advance(1);
+            self.at_line_start = true;
+            self.line_indent = 0;
         } else {
             return;
         }
@@ -491,26 +572,64 @@ pub const Scanner = struct {
         var pending_blanks: usize = 0;
 
         while (self.pos < self.source.len) {
-            // Count leading spaces
+            // Count leading spaces. Tabs in indentation are invalid.
             var line_spaces: u32 = 0;
             var tmp_pos = self.pos;
             while (tmp_pos < self.source.len and self.source[tmp_pos] == ' ') {
                 line_spaces += 1;
                 tmp_pos += 1;
             }
+            // Tabs in the indentation area of block scalar content are invalid.
+            if (tmp_pos < self.source.len and self.source[tmp_pos] == '\t' and
+                content_indent != null and line_spaces < content_indent.?)
+            {
+                return error.TabInIndent;
+            }
 
-            const at_eol = tmp_pos >= self.source.len or isNewline(self.source[tmp_pos]);
+            // Check if rest of line is blank (spaces/tabs before newline/EOF).
+            var eol_check = tmp_pos;
+            while (eol_check < self.source.len and
+                isWhitespace(self.source[eol_check]))
+            {
+                eol_check += 1;
+            }
+            const at_eol = eol_check >= self.source.len or
+                isNewline(self.source[eol_check]);
 
-            // Before content_indent is known, blank lines are just pending
+            // Before content_indent is known, blank lines are just pending.
             if (content_indent == null) {
                 if (at_eol) {
+                    // Reject tab-only indentation on blank lines.
+                    if (line_spaces == 0 and tmp_pos < self.source.len and
+                        self.source[tmp_pos] == '\t')
+                    {
+                        return error.TabInIndent;
+                    }
                     pending_blanks += 1;
                     self.pos = tmp_pos;
                     if (self.pos < self.source.len) self.advance(1);
                     continue;
                 }
-                if (line_spaces == 0) break;
-                content_indent = line_spaces;
+                if (line_spaces == 0) {
+                    // Zero-indent content is valid only when the block
+                    // scalar follows a document header (--- >). Detect
+                    // this by checking if a document_header token
+                    // precedes the block scalar header.
+                    if (after_doc_header) {
+                        // Still stop at doc markers and comments.
+                        if (tmp_pos < self.source.len and
+                            (self.looksLikeDocMarkerAt(tmp_pos) or
+                                self.source[tmp_pos] == '#'))
+                        {
+                            break;
+                        }
+                        content_indent = 0;
+                    } else {
+                        break;
+                    }
+                } else {
+                    content_indent = line_spaces;
+                }
             }
 
             const ci = content_indent.?;
@@ -551,6 +670,10 @@ pub const Scanner = struct {
 
         // pending_blanks at end = trailing blank lines after last content
         trailing_blank_lines = pending_blanks;
+
+        // Restore line-start state after block scalar processing.
+        self.at_line_start = true;
+        self.line_indent = 0;
 
         if (content_lines.items.len == 0) return;
 
@@ -633,18 +756,40 @@ pub const Scanner = struct {
     fn scanAlias(self: *Scanner) !void {
         const name_start = self.pos + 1;
         self.advance(1);
-        while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
-            !isFlowIndicator(self.source[self.pos]) and self.source[self.pos] != ':')
+        while (self.pos < self.source.len and
+            !isWhitespaceOrNewline(self.source[self.pos]) and
+            !isFlowIndicator(self.source[self.pos]))
+        {
+            // Stop at ':' only when it is a mapping value indicator.
+            if (self.source[self.pos] == ':') {
+                if (self.pos + 1 >= self.source.len or
+                    isWhitespaceOrNewline(self.source[self.pos + 1]) or
+                    (self.flow_level > 0 and
+                        isFlowIndicator(self.source[self.pos + 1])))
+                    break;
+            }
             self.advance(1);
+        }
         try self.addTokenWithOrigin(.alias, "*", self.source[name_start..self.pos]);
     }
 
     fn scanTag(self: *Scanner) !void {
         const start = self.pos;
         self.advance(1);
-        while (self.pos < self.source.len and !isWhitespaceOrNewline(self.source[self.pos]) and
-            !isFlowIndicator(self.source[self.pos]))
+        // Verbatim tags !<...> can contain flow indicators.
+        if (self.pos < self.source.len and self.source[self.pos] == '<') {
             self.advance(1);
+            while (self.pos < self.source.len and self.source[self.pos] != '>') {
+                if (isNewline(self.source[self.pos])) return error.SyntaxError;
+                self.advance(1);
+            }
+            if (self.pos < self.source.len) self.advance(1); // consume >
+        } else {
+            while (self.pos < self.source.len and
+                !isWhitespaceOrNewline(self.source[self.pos]) and
+                !isFlowIndicator(self.source[self.pos]))
+                self.advance(1);
+        }
         try self.addToken(.tag, self.source[start..self.pos]);
     }
 
@@ -654,114 +799,134 @@ pub const Scanner = struct {
             self.advance(2);
             return;
         }
+        if (self.flow_level > 0) try self.rejectAmbiguousFlowIndicator();
 
         const start = self.pos;
-        const after_mapping_value = self.lastTokenType() == .mapping_value;
-        const base_indent = if (after_mapping_value)
-            self.last_key_indent
-        else
-            self.line_indent;
+        const in_flow = self.flow_level > 0;
+        const ctx = PlainContext{
+            .in_flow = in_flow,
+            .after_mapping_value = self.lastTokenType() == .mapping_value,
+            .after_seq_entry = self.lastTokenType() == .sequence_entry,
+            .base_indent = if (self.lastTokenType() == .mapping_value)
+                self.last_key_indent
+            else
+                self.line_indent,
+        };
 
-        var end = self.pos;
+        var end = self.scanPlainLine(in_flow);
+        while (end > start and isWhitespace(self.source[end - 1])) end -= 1;
+
+        if (self.pos >= self.source.len or !isNewline(self.source[self.pos])) {
+            try self.addPlainToken(self.source[start..end]);
+            return;
+        }
+
+        var buf: Buf = .empty;
+        try self.bufAppendSlice(&buf, self.source[start..end]);
+
+        while (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+            const saved = self.savePos();
+            self.advance(1);
+            const blank_count = self.skipBlankLines();
+            const next_indent = self.measureIndent();
+
+            if (!self.plainContinues(ctx, next_indent)) {
+                self.restorePos(saved);
+                break;
+            }
+
+            try self.bufAppend(&buf, if (blank_count > 0) '\n' else ' ');
+            const cont_start = self.pos;
+            end = self.scanPlainLine(in_flow);
+            while (end > cont_start and isWhitespace(self.source[end - 1])) end -= 1;
+            try self.bufAppendSlice(&buf, self.source[cont_start..end]);
+        }
+
+        try self.addPlainToken(buf.items);
+    }
+
+    const PlainContext = struct {
+        in_flow: bool,
+        after_mapping_value: bool,
+        after_seq_entry: bool,
+        base_indent: u32,
+    };
+
+    const SavedPos = struct { pos: usize, line: u32, column: u32 };
+
+    fn savePos(self: *const Scanner) SavedPos {
+        return .{ .pos = self.pos, .line = self.line, .column = self.column };
+    }
+
+    fn restorePos(self: *Scanner, saved: SavedPos) void {
+        self.pos = saved.pos;
+        self.line = saved.line;
+        self.column = saved.column;
+    }
+
+    fn rejectAmbiguousFlowIndicator(self: *const Scanner) !void {
+        const c = self.source[self.pos];
+        if (c != '-' and c != '?' and c != ':') return;
+        const has_next = self.pos + 1 < self.source.len;
+        if (!has_next or isWhitespaceOrNewline(self.source[self.pos + 1]) or
+            isFlowIndicator(self.source[self.pos + 1]))
+            return error.SyntaxError;
+    }
+
+    fn skipBlankLines(self: *Scanner) usize {
+        var count: usize = 0;
+        while (self.pos < self.source.len) {
+            const bpos = self.pos;
+            const bcol = self.column;
+            while (self.pos < self.source.len and isWhitespace(self.source[self.pos]))
+                self.advance(1);
+            if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
+                count += 1;
+                self.advance(1);
+            } else {
+                self.pos = bpos;
+                self.column = bcol;
+                break;
+            }
+        }
+        return count;
+    }
+
+    fn measureIndent(self: *Scanner) u32 {
+        var indent: u32 = 0;
+        while (self.pos < self.source.len and isWhitespace(self.source[self.pos])) {
+            indent += 1;
+            self.advance(1);
+        }
+        return indent;
+    }
+
+    fn plainContinues(self: *Scanner, ctx: PlainContext, next_indent: u32) bool {
+        if (self.pos >= self.source.len or isNewline(self.source[self.pos])) return false;
+        if (ctx.in_flow) {
+            const nc = self.source[self.pos];
+            return !isFlowIndicator(nc) and nc != '#' and !self.looksLikeDocMarker();
+        }
+        if ((ctx.after_mapping_value or ctx.after_seq_entry) and
+            next_indent <= ctx.base_indent) return false;
+        if (!ctx.after_mapping_value and !ctx.after_seq_entry and
+            next_indent < ctx.base_indent) return false;
+        if (self.source[self.pos] == '#' or self.looksLikeNewKey() or
+            self.looksLikeDocMarker()) return false;
+        if (self.looksLikeSequenceEntry() and next_indent <= ctx.base_indent) return false;
+        return true;
+    }
+
+    fn scanPlainLine(self: *Scanner, in_flow: bool) usize {
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
             if (isNewline(c)) break;
-            if (self.flow_level > 0 and isFlowIndicator(c)) break;
+            if (in_flow and isFlowIndicator(c)) break;
             if (c == ':' and self.isMappingValue()) break;
             if (c == '#' and self.isPrecededByWhitespace()) break;
             self.advance(1);
-            end = self.pos;
         }
-
-        while (end > start and isWhitespace(self.source[end - 1])) end -= 1;
-
-        if (self.flow_level == 0 and self.pos < self.source.len and
-            isNewline(self.source[self.pos]))
-        {
-            var buf: ?Buf = null;
-
-            while (self.pos < self.source.len and isNewline(self.source[self.pos])) {
-                const saved_pos = self.pos;
-                const saved_line = self.line;
-                const saved_col = self.column;
-                self.advance(1);
-
-                var blank_count: usize = 0;
-                while (self.pos < self.source.len) {
-                    const bpos = self.pos;
-                    while (self.pos < self.source.len and self.source[self.pos] == ' ')
-                        self.advance(1);
-                    if (self.pos < self.source.len and isNewline(self.source[self.pos])) {
-                        blank_count += 1;
-                        self.advance(1);
-                    } else {
-                        self.pos = bpos;
-                        self.column = saved_col;
-                        break;
-                    }
-                }
-
-                var next_indent: u32 = 0;
-                while (self.pos < self.source.len and self.source[self.pos] == ' ') {
-                    next_indent += 1;
-                    self.advance(1);
-                }
-
-                if (self.pos >= self.source.len or
-                    isNewline(self.source[self.pos]) or
-                    (after_mapping_value and next_indent <= base_indent) or
-                    (!after_mapping_value and next_indent < base_indent))
-                {
-                    self.pos = saved_pos;
-                    self.line = saved_line;
-                    self.column = saved_col;
-                    break;
-                }
-
-                if (self.source[self.pos] == '#' or
-                    self.looksLikeNewKey() or
-                    (self.looksLikeSequenceEntry() and
-                        next_indent <= base_indent) or
-                    self.looksLikeDocMarker())
-                {
-                    self.pos = saved_pos;
-                    self.line = saved_line;
-                    self.column = saved_col;
-                    break;
-                }
-
-                if (buf == null) {
-                    buf = .empty;
-                    try self.bufAppendSlice(&buf.?, self.source[start..end]);
-                }
-
-                if (blank_count > 0) {
-                    try self.bufAppend(&buf.?, '\n');
-                } else {
-                    try self.bufAppend(&buf.?, ' ');
-                }
-
-                const cont_start = self.pos;
-                while (self.pos < self.source.len and !isNewline(self.source[self.pos])) {
-                    const cc = self.source[self.pos];
-                    if (cc == ':' and self.isMappingValue()) break;
-                    if (cc == '#' and self.isPrecededByWhitespace()) break;
-                    self.advance(1);
-                }
-                var cont_end = self.pos;
-                while (cont_end > cont_start and isWhitespace(self.source[cont_end - 1]))
-                    cont_end -= 1;
-                try self.bufAppendSlice(&buf.?, self.source[cont_start..cont_end]);
-                end = cont_end;
-            }
-
-            if (buf) |b| {
-                try self.addPlainToken(b.items);
-                return;
-            }
-        }
-
-        try self.addPlainToken(self.source[start..end]);
+        return self.pos;
     }
 
     fn addPlainToken(self: *Scanner, val: []const u8) !void {
@@ -858,14 +1023,18 @@ pub const Scanner = struct {
             isNewline(self.source[self.pos + 1]);
     }
 
-    fn looksLikeDocMarker(self: *Scanner) bool {
-        if (self.pos + 2 >= self.source.len) return false;
-        const slice = self.source[self.pos .. self.pos + 3];
+    fn looksLikeDocMarkerAt(self: *Scanner, p: usize) bool {
+        if (p + 2 >= self.source.len) return false;
+        const slice = self.source[p .. p + 3];
         if (std.mem.eql(u8, slice, "---") or std.mem.eql(u8, slice, "...")) {
-            if (self.pos + 3 >= self.source.len) return true;
-            return isWhitespaceOrNewline(self.source[self.pos + 3]);
+            if (p + 3 >= self.source.len) return true;
+            return isWhitespaceOrNewline(self.source[p + 3]);
         }
         return false;
+    }
+
+    fn looksLikeDocMarker(self: *Scanner) bool {
+        return self.looksLikeDocMarkerAt(self.pos);
     }
 };
 
