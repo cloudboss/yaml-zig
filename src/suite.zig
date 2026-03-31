@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-const yaml = @import("yaml.zig");
+const parser = @import("parser.zig");
 
 const suite_dir = "yaml-test-suite";
 
@@ -79,11 +79,11 @@ fn runCase(
     const expects_error = hasFile(case_dir, "error");
 
     const ok = if (expects_error) blk: {
-        var doc = yaml.parse(allocator, in_yaml) catch break :blk true;
+        var doc = parser.parse(allocator, in_yaml) catch break :blk true;
         doc.deinit();
         break :blk false;
     } else blk: {
-        var doc = yaml.parse(allocator, in_yaml) catch break :blk false;
+        var doc = parser.parse(allocator, in_yaml) catch break :blk false;
         doc.deinit();
         break :blk true;
     };

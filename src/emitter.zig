@@ -4,8 +4,8 @@ const testing = std.testing;
 
 const ast = @import("ast.zig");
 const Node = ast.Node;
+const parser = @import("parser.zig");
 const token = @import("token.zig");
-const yaml = @import("yaml.zig");
 
 pub const EmitOptions = struct {
     indent: u8 = 2,
@@ -539,7 +539,7 @@ fn writeIndent(w: *Writer, indent: u16) Allocator.Error!void {
 }
 
 fn roundTrip(input: []const u8) !void {
-    var doc = try yaml.parse(testing.allocator, input);
+    var doc = try parser.parse(testing.allocator, input);
     defer doc.deinit();
     const body = doc.body orelse return error.TestExpectedValue;
     const output = try emit(testing.allocator, body.*, .{});
@@ -548,7 +548,7 @@ fn roundTrip(input: []const u8) !void {
 }
 
 fn roundTripNormalized(input: []const u8, expected: []const u8) !void {
-    var doc = try yaml.parse(testing.allocator, input);
+    var doc = try parser.parse(testing.allocator, input);
     defer doc.deinit();
     const body = doc.body orelse return error.TestExpectedValue;
     const output = try emit(testing.allocator, body.*, .{});

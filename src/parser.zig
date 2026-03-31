@@ -3,14 +3,15 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const ast = @import("ast.zig");
+const Document = ast.Document;
 const Node = ast.Node;
 const Detail = @import("error.zig").Detail;
+const scanner = @import("scanner.zig");
 const token = @import("token.zig");
 const Token = token.Token;
 const TokenType = token.TokenType;
 const Position = token.Position;
 const toNumber = token.toNumber;
-const yaml = @import("yaml.zig");
 
 const ParseErr = error{
     SyntaxError,
@@ -1786,8 +1787,89 @@ pub const Parser = struct {
     }
 };
 
-fn testParse(source: []const u8) !yaml.Document {
-    return yaml.parse(testing.allocator, source);
+pub fn parse(allocator: Allocator, source: []const u8) !Document {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var s = scanner.Scanner.init(arena_alloc, source);
+    const tokens = try s.scan();
+
+    for (tokens, 0..) |*t, i| {
+        if (i > 0) t.prev = &tokens[i - 1];
+        if (i + 1 < tokens.len) t.next = &tokens[i + 1];
+    }
+
+    var p = Parser.init(arena_alloc);
+    const root = try p.parse(tokens);
+
+    var body_ptr: ?*Node = null;
+    switch (root) {
+        .document => |d| {
+            body_ptr = if (d.body) |b| @constCast(b) else null;
+        },
+        else => {
+            const node = try arena_alloc.create(Node);
+            node.* = root;
+            body_ptr = node;
+        },
+    }
+
+    return Document{ .arena = arena, .body = body_ptr };
+}
+
+pub fn parseAll(allocator: Allocator, source: []const u8) !ast.Stream {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var s = scanner.Scanner.init(arena_alloc, source);
+    const tokens = try s.scan();
+
+    var docs = std.ArrayListUnmanaged(Document){};
+    var doc_start: usize = 0;
+    var i: usize = 0;
+    var found_header = false;
+
+    while (i < tokens.len) {
+        if (tokens[i].token_type == .document_header) {
+            if (found_header or doc_start < i) {
+                try docs.append(arena_alloc, try parseDocSlice(arena_alloc, tokens[doc_start..i]));
+            }
+            doc_start = i;
+            found_header = true;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    if (doc_start < tokens.len) {
+        try docs.append(arena_alloc, try parseDocSlice(arena_alloc, tokens[doc_start..]));
+    }
+
+    return ast.Stream{ .arena = arena, .docs = docs.items };
+}
+
+fn parseDocSlice(allocator: Allocator, tokens: []const Token) !Document {
+    var p = Parser.init(allocator);
+    const root = try p.parse(tokens);
+    var body_ptr: ?*Node = null;
+    switch (root) {
+        .document => |d| {
+            body_ptr = if (d.body) |b| @constCast(b) else null;
+        },
+        else => {
+            const node = try allocator.create(Node);
+            node.* = root;
+            body_ptr = node;
+        },
+    }
+    return Document{ .body = body_ptr };
+}
+
+fn testParse(source: []const u8) !Document {
+    return parse(testing.allocator, source);
 }
 
 fn expectString(node: *const Node, expected: []const u8) !void {
@@ -3069,7 +3151,7 @@ test "parse anchor and alias in flow" {
 }
 
 test "parse multi-document" {
-    var file = try yaml.parseAll(
+    var stream = try parseAll(
         testing.allocator,
         \\---
         \\a: 1
@@ -3078,8 +3160,8 @@ test "parse multi-document" {
         \\
         ,
     );
-    defer file.deinit();
-    try testing.expectEqual(@as(usize, 2), file.docs.len);
+    defer stream.deinit();
+    try testing.expectEqual(@as(usize, 2), stream.docs.len);
 }
 
 test "parse baseball teams" {

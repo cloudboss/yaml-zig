@@ -2,6 +2,28 @@ const std = @import("std");
 
 const Token = @import("token.zig").Token;
 
+pub const Document = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    body: ?*Node = null,
+
+    pub fn deinit(self: *Document) void {
+        if (self.arena) |*a| {
+            a.deinit();
+        }
+    }
+};
+
+pub const Stream = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    docs: []Document = &.{},
+
+    pub fn deinit(self: *Stream) void {
+        if (self.arena) |*a| {
+            a.deinit();
+        }
+    }
+};
+
 pub const NodeType = enum {
     document,
     null_value,
