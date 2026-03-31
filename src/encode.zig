@@ -7,7 +7,7 @@ const Node = @import("ast.zig").Node;
 const Value = @import("value.zig").Value;
 const token = @import("token.zig");
 
-pub const EncodeOptions = struct {
+pub const StringifyOptions = struct {
     indent: u8 = 2,
     flow_style: bool = false,
     use_literal_multiline: bool = false,
@@ -16,7 +16,7 @@ pub const EncodeOptions = struct {
     indent_sequence: bool = false,
 };
 
-pub fn encode(allocator: Allocator, val: anytype, options: EncodeOptions) ![]u8 {
+pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
     var list = std.ArrayListUnmanaged(u8){};
     errdefer list.deinit(allocator);
     const writer = list.writer(allocator);
@@ -27,7 +27,11 @@ pub fn encode(allocator: Allocator, val: anytype, options: EncodeOptions) ![]u8 
     return list.toOwnedSlice(allocator);
 }
 
-pub fn encodeToNode(allocator: Allocator, val: anytype, options: EncodeOptions) !Node {
+pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void {
+    try writeValue(@TypeOf(val), writer, val, 0, options, false);
+}
+
+pub fn encodeToNode(allocator: Allocator, val: anytype, options: StringifyOptions) !Node {
     _ = allocator;
     _ = val;
     _ = options;
@@ -46,7 +50,7 @@ fn writeValue(
     writer: anytype,
     val: T,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
     flow: bool,
 ) !void {
     const ti = @typeInfo(T);
@@ -167,7 +171,7 @@ fn writeStringValue(
     writer: anytype,
     val: []const u8,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     // Detect line ending type.
     const line_end = detectLineEnding(val);
@@ -217,7 +221,7 @@ fn writeBlockScalar(
     writer: anytype,
     val: []const u8,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
     line_end: LineEnding,
 ) !void {
     const sep: []const u8 = switch (line_end) {
@@ -309,7 +313,7 @@ fn writeSlice(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     writeSliceInner(Child, writer, val, depth, options, true) catch |err| return err;
 }
@@ -319,7 +323,7 @@ fn writeSliceTop(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     writeSliceInner(Child, writer, val, depth, options, false) catch |err| return err;
 }
@@ -329,7 +333,7 @@ fn writeSliceInner(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
     prefix_first: bool,
 ) !void {
     if (val.len == 0) {
@@ -352,7 +356,7 @@ fn writeStruct(
     writer: anytype,
     val: T,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     if (s.fields.len == 0) {
         try writer.writeAll("{}");
@@ -379,7 +383,7 @@ fn writeFieldValue(
     writer: anytype,
     val: T,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     const ti = @typeInfo(T);
     if (ti == .@"struct") {
@@ -486,7 +490,7 @@ fn writeValueUnion(
     writer: anytype,
     val: Value,
     depth: u32,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
@@ -569,7 +573,7 @@ fn writeFlowValue(
     comptime T: type,
     writer: anytype,
     val: T,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     const ti = @typeInfo(T);
     switch (ti) {
@@ -622,7 +626,7 @@ fn writeFlowSlice(
     comptime Child: type,
     writer: anytype,
     val: []const Child,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     if (val.len == 0) {
         try writer.writeAll("[]");
@@ -641,7 +645,7 @@ fn writeFlowStruct(
     comptime T: type,
     writer: anytype,
     val: T,
-    options: EncodeOptions,
+    options: StringifyOptions,
 ) !void {
     if (s.fields.len == 0) {
         try writer.writeAll("{}");
@@ -659,7 +663,7 @@ fn writeFlowStruct(
     try writer.writeByte('}');
 }
 
-fn writeFlowValueUnion(writer: anytype, val: Value, options: EncodeOptions) !void {
+fn writeFlowValueUnion(writer: anytype, val: Value, options: StringifyOptions) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
         .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
@@ -696,15 +700,15 @@ fn writeFlowValueUnion(writer: anytype, val: Value, options: EncodeOptions) !voi
 }
 
 fn testEncode(val: anytype) ![]u8 {
-    return encode(testing.allocator, val, .{});
+    return stringifyAlloc(testing.allocator, val, .{});
 }
 
-fn testEncodeOpts(val: anytype, opts: EncodeOptions) ![]u8 {
-    return encode(testing.allocator, val, opts);
+fn testEncodeOpts(val: anytype, opts: StringifyOptions) ![]u8 {
+    return stringifyAlloc(testing.allocator, val, opts);
 }
 
-fn testEncodeWithOptions(val: anytype, opts: EncodeOptions) ![]u8 {
-    return encode(testing.allocator, val, opts);
+fn testEncodeWithOptions(val: anytype, opts: StringifyOptions) ![]u8 {
+    return stringifyAlloc(testing.allocator, val, opts);
 }
 
 test "encode null pointer" {

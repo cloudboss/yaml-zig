@@ -11,6 +11,7 @@ pub const ParseOptions = decoder.ParseOptions;
 pub const Parsed = decoder.Parsed;
 pub const emitter = @import("emitter.zig");
 pub const encoder = @import("encode.zig");
+pub const StringifyOptions = encoder.StringifyOptions;
 pub const err = @import("error.zig");
 pub const parser = @import("parser.zig");
 pub const scanner = @import("scanner.zig");
@@ -27,8 +28,12 @@ pub fn parseFromSlice(
     return decoder.decode(T, allocator, source, options);
 }
 
-pub fn encode(allocator: Allocator, val: anytype) ![]u8 {
-    return encoder.encode(allocator, val, .{});
+pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
+    return encoder.stringifyAlloc(allocator, val, options);
+}
+
+pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void {
+    return encoder.stringify(val, options, writer);
 }
 
 test {
@@ -76,7 +81,7 @@ test "parseAll stream of documents" {
     try testing.expectEqual(@as(usize, 3), stream.docs.len);
 }
 
-test "full pipeline parseFromSlice encode" {
+test "full pipeline parseFromSlice stringifyAlloc" {
     const Config = struct {
         name: []const u8,
         port: u16,
@@ -90,7 +95,7 @@ test "full pipeline parseFromSlice encode" {
     defer parsed.deinit();
     try testing.expectEqualStrings("myapp", parsed.value.name);
     try testing.expectEqual(@as(u16, 3000), parsed.value.port);
-    const output = try encode(testing.allocator, parsed.value);
+    const output = try stringifyAlloc(testing.allocator, parsed.value, .{});
     defer testing.allocator.free(output);
     try testing.expectEqualStrings(input, output);
 }
