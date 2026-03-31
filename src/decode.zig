@@ -4,11 +4,10 @@ const testing = std.testing;
 
 const ast = @import("ast.zig");
 const Node = ast.Node;
-const parser_mod = @import("parser.zig");
-const scanner_mod = @import("scanner.zig");
+const parser = @import("parser.zig");
+const scanner = @import("scanner.zig");
 const token = @import("token.zig");
 const Value = @import("value.zig").Value;
-const yaml = @import("yaml.zig");
 
 pub const ParseOptions = struct {
     ignore_unknown_fields: bool = true,
@@ -64,13 +63,13 @@ pub fn decode(
 }
 
 fn scanAndParse(allocator: Allocator, source: []const u8) !Node {
-    var s = scanner_mod.Scanner.init(allocator, source);
+    var s = scanner.Scanner.init(allocator, source);
     const tokens = try s.scan();
     for (tokens, 0..) |*t, i| {
         if (i > 0) t.prev = &tokens[i - 1];
         if (i + 1 < tokens.len) t.next = &tokens[i + 1];
     }
-    var p = parser_mod.Parser.init(allocator);
+    var p = parser.Parser.init(allocator);
     return p.parse(tokens);
 }
 

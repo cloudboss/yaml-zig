@@ -2,16 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+const decoder = @import("decode.zig");
+const encoder = @import("encode.zig");
+
 pub const ast = @import("ast.zig");
-pub const Node = ast.Node;
-pub const Document = ast.Document;
-pub const Stream = ast.Stream;
-pub const decoder = @import("decode.zig");
-pub const ParseOptions = decoder.ParseOptions;
-pub const Parsed = decoder.Parsed;
 pub const emitter = @import("emitter.zig");
-pub const encoder = @import("encode.zig");
-pub const StringifyOptions = encoder.StringifyOptions;
 pub const err = @import("error.zig");
 pub const parser = @import("parser.zig");
 pub const scanner = @import("scanner.zig");
@@ -19,12 +14,20 @@ pub const suite = @import("suite.zig");
 pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 
+pub const Document = ast.Document;
+pub const Node = ast.Node;
+pub const Stream = ast.Stream;
+pub const Value = value.Value;
+pub const ParseOptions = decoder.ParseOptions;
+pub const Parsed = decoder.Parsed;
+pub const StringifyOptions = encoder.StringifyOptions;
+
 pub fn parseFromSlice(
     comptime T: type,
     allocator: Allocator,
     source: []const u8,
     options: ParseOptions,
-) !decoder.Parsed(T) {
+) !Parsed(T) {
     return decoder.decode(T, allocator, source, options);
 }
 
