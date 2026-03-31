@@ -7,6 +7,7 @@ pub const Node = ast.Node;
 pub const Document = ast.Document;
 pub const Stream = ast.Stream;
 pub const decoder = @import("decode.zig");
+pub const ParseOptions = decoder.ParseOptions;
 pub const Parsed = decoder.Parsed;
 pub const emitter = @import("emitter.zig");
 pub const encoder = @import("encode.zig");
@@ -21,7 +22,7 @@ pub fn parseFromSlice(
     comptime T: type,
     allocator: Allocator,
     source: []const u8,
-    options: decoder.DecodeOptions,
+    options: ParseOptions,
 ) !decoder.Parsed(T) {
     return decoder.decode(T, allocator, source, options);
 }

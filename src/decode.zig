@@ -10,8 +10,8 @@ const token = @import("token.zig");
 const Value = @import("value.zig").Value;
 const yaml = @import("yaml.zig");
 
-pub const DecodeOptions = struct {
-    disallow_unknown_fields: bool = false,
+pub const ParseOptions = struct {
+    ignore_unknown_fields: bool = true,
     max_depth: u32 = 10_000,
 };
 
@@ -32,7 +32,7 @@ pub fn decode(
     comptime T: type,
     allocator: Allocator,
     source: []const u8,
-    options: DecodeOptions,
+    options: ParseOptions,
 ) !Parsed(T) {
     // Temporary arena for scanner tokens, AST nodes, and preprocessed source.
     // Freed before returning — nothing in the result references this.
@@ -242,7 +242,7 @@ pub fn decodeNode(
     comptime T: type,
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
 ) !T {
     var anchors = AnchorMap.init(allocator);
     defer anchors.deinit();
@@ -303,7 +303,7 @@ fn decodeNodeInternal(
     comptime T: type,
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
     // Unwrap document nodes.
@@ -462,7 +462,7 @@ fn decodeMappingValueAsMapping(
     comptime T: type,
     allocator: Allocator,
     mv: ast.MappingValueNode,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
     const info = @typeInfo(T);
@@ -520,7 +520,7 @@ fn decodeMappingValueAsMapping(
                         fields_set[idx] = true;
                     }
                 }
-                if (options.disallow_unknown_fields) {
+                if (!options.ignore_unknown_fields) {
                     var found = false;
                     inline for (fields) |field| {
                         if (std.mem.eql(u8, key_str, field.name)) {
@@ -551,7 +551,7 @@ fn decodeMappingValueAsMapping(
 fn decodeMappingValueToValue(
     allocator: Allocator,
     mv: ast.MappingValueNode,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) DecodeErrorSet!Value {
     // Handle merge key in mapping_value.
@@ -1014,7 +1014,7 @@ fn decodeToStruct(
     comptime T: type,
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
     if (node == .null_value) {
@@ -1097,7 +1097,7 @@ fn decodeToStruct(
             }
         }
 
-        if (options.disallow_unknown_fields) {
+        if (!options.ignore_unknown_fields) {
             var found = false;
             inline for (fields) |field| {
                 if (std.mem.eql(u8, key_str, field.name)) {
@@ -1199,7 +1199,7 @@ fn applyMergeToStruct(
     fields_set: []bool,
     allocator: Allocator,
     val_node: *const Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !void {
     // Resolve the value node through aliases/anchors.
@@ -1293,7 +1293,7 @@ fn decodeToSlice(
     comptime T: type,
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
     const Child = @typeInfo(T).pointer.child;
@@ -1310,7 +1310,7 @@ fn decodeToArray(
     comptime T: type,
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
     const info = @typeInfo(T).array;
@@ -1327,7 +1327,7 @@ fn decodeToArray(
 fn decodeToValue(
     allocator: Allocator,
     node: Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) DecodeErrorSet!Value {
     return switch (node) {
@@ -1405,7 +1405,7 @@ fn decodeToValue(
 fn decodeMappingToValue(
     allocator: Allocator,
     mapping: ast.MappingNode,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) DecodeErrorSet!Value {
     // First pass: count total entries including merges.
@@ -1470,7 +1470,7 @@ fn applyMergeToValueMap(
     keys_list: *std.ArrayListUnmanaged(Value),
     vals_list: *std.ArrayListUnmanaged(Value),
     val_node: *const Node,
-    options: DecodeOptions,
+    options: ParseOptions,
     anchors: *AnchorMap,
 ) DecodeErrorSet!void {
     // Resolve through aliases/anchors.
@@ -1561,7 +1561,7 @@ fn testDecode(comptime T: type, source: []const u8) !Parsed(T) {
 
 fn testDecodeStrict(comptime T: type, source: []const u8) !Parsed(T) {
     return decode(T, testing.allocator, source, .{
-        .disallow_unknown_fields = true,
+        .ignore_unknown_fields = false,
     });
 }
 
@@ -3711,7 +3711,7 @@ test "decode unknown field strict mode" {
         Config,
         testing.allocator,
         "name: app\nunknown: field",
-        .{ .disallow_unknown_fields = true },
+        .{ .ignore_unknown_fields = false },
     );
     try testing.expectError(error.UnknownField, result);
 }
@@ -4416,7 +4416,7 @@ test "disallow unknown nested" {
         \\  b: 1
         \\
     ,
-        .{ .disallow_unknown_fields = true },
+        .{ .ignore_unknown_fields = false },
     );
     try testing.expectError(error.UnknownField, result);
 }
