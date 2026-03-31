@@ -17,8 +17,13 @@ pub const suite = @import("suite.zig");
 pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 
-pub fn decode(comptime T: type, allocator: Allocator, source: []const u8) !decoder.Parsed(T) {
-    return decoder.decode(T, allocator, source, .{});
+pub fn parseFromSlice(
+    comptime T: type,
+    allocator: Allocator,
+    source: []const u8,
+    options: decoder.DecodeOptions,
+) !decoder.Parsed(T) {
+    return decoder.decode(T, allocator, source, options);
 }
 
 pub fn encode(allocator: Allocator, val: anytype) ![]u8 {
@@ -70,7 +75,7 @@ test "parseAll stream of documents" {
     try testing.expectEqual(@as(usize, 3), stream.docs.len);
 }
 
-test "full pipeline parse decode encode" {
+test "full pipeline parseFromSlice encode" {
     const Config = struct {
         name: []const u8,
         port: u16,
@@ -80,7 +85,7 @@ test "full pipeline parse decode encode" {
         \\port: 3000
         \\
     ;
-    const parsed = try decode(Config, testing.allocator, input);
+    const parsed = try parseFromSlice(Config, testing.allocator, input, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("myapp", parsed.value.name);
     try testing.expectEqual(@as(u16, 3000), parsed.value.port);
