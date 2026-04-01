@@ -2,7 +2,7 @@
 
 A standards compliant YAML 1.2 parser and serializer for Zig. Follows an API similar to Zig's `std.json`.
 
-Passes the [YAML test suite](https://github.com/yaml/yaml-test-suite).
+Inspired by [goccy/go-yaml](https://github.com/goccy/go-yaml) and borrows heavily from the test suite. Passes the [official YAML test suite](https://github.com/yaml/yaml-test-suite).
 
 API docs are at [https://cloudboss.co/yaml-zig](https://cloudboss.co/yaml-zig/).
 
