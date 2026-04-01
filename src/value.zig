@@ -1,6 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// A dynamically-typed YAML value.
+///
+/// Represents any YAML scalar, sequence, or mapping without requiring a
+/// compile-time Zig type. Useful for working with YAML of unknown structure.
+/// Can be used as the target type for `parseFromSlice`.
 pub const Value = union(enum) {
     null,
     boolean: bool,
@@ -10,11 +15,14 @@ pub const Value = union(enum) {
     sequence: []const Value,
     mapping: Mapping,
 
+    /// A YAML mapping represented as parallel key/value slices.
     pub const Mapping = struct {
         keys: []const Value,
         values: []const Value,
     };
 
+    /// Look up a string key in a mapping value.
+    /// Returns null if this is not a mapping or the key is not found.
     pub fn mappingGet(
         self: Value,
         key: []const u8,
@@ -36,6 +44,7 @@ pub const Value = union(enum) {
         }
     }
 
+    /// Deep equality comparison between two values.
     pub fn eql(self: Value, other: Value) bool {
         const Tag = std.meta.Tag(Value);
         const self_tag: Tag = self;

@@ -1,11 +1,23 @@
+//! YAML abstract syntax tree types.
+//!
+//! These types represent the parsed structure of a YAML document. Use
+//! `parser.parse` or `parser.parseAll` to produce them, and `emitter.emit`
+//! to serialize them back to YAML text.
+
 const std = @import("std");
 
 const Token = @import("token.zig").Token;
 
+/// A single YAML document, optionally backed by an arena allocator.
+///
+/// When returned by `parser.parse`, the arena owns all AST nodes and tokens.
+/// Call `deinit()` to free everything.
 pub const Document = struct {
     arena: ?std.heap.ArenaAllocator = null,
+    /// The root AST node of the document, or null for an empty document.
     body: ?*Node = null,
 
+    /// Free all memory owned by this document.
     pub fn deinit(self: *Document) void {
         if (self.arena) |*a| {
             a.deinit();
@@ -13,10 +25,15 @@ pub const Document = struct {
     }
 };
 
+/// A stream of multiple YAML documents from a single input.
+///
+/// Returned by `parser.parseAll`. Call `deinit()` to free everything.
 pub const Stream = struct {
     arena: ?std.heap.ArenaAllocator = null,
+    /// The documents in the stream, in order.
     docs: []Document = &.{},
 
+    /// Free all memory owned by this stream.
     pub fn deinit(self: *Stream) void {
         if (self.arena) |*a| {
             a.deinit();
@@ -24,6 +41,7 @@ pub const Stream = struct {
     }
 };
 
+/// Discriminator for the `Node` tagged union.
 pub const NodeType = enum {
     document,
     null_value,
@@ -47,6 +65,11 @@ pub const NodeType = enum {
     merge_key,
 };
 
+/// A tagged union representing any YAML AST node.
+///
+/// Each variant holds a node-specific struct with a `token` pointer back to
+/// the source, an optional `node_comment`, a `path` string, and
+/// variant-specific data (e.g. `value` for scalars, `values` for collections).
 pub const Node = union(NodeType) {
     document: DocumentNode,
     null_value: NullNode,
@@ -69,12 +92,14 @@ pub const Node = union(NodeType) {
     comment_group: CommentGroupNode,
     merge_key: MergeKeyNode,
 
+    /// Return the source token for this node, if any.
     pub fn getToken(self: Node) ?*const Token {
         return switch (self) {
             inline else => |n| n.token,
         };
     }
 
+    /// Return the comment group attached to this node, if any.
     pub fn getComment(self: Node) ?*const CommentGroupNode {
         return switch (self) {
             inline else => |n| if (@hasField(
@@ -84,6 +109,7 @@ pub const Node = union(NodeType) {
         };
     }
 
+    /// Return the dotted key path to this node (e.g. `"a.b.c"`), or empty string.
     pub fn getPath(self: Node) []const u8 {
         return switch (self) {
             inline else => |n| if (@hasField(
@@ -158,14 +184,21 @@ pub const LiteralNode = struct {
     chomping: ChompingStyle = .clip,
 };
 
+/// Block scalar style: `|` (literal) preserves newlines, `>` (folded) joins lines.
 pub const BlockScalarStyle = enum {
+    /// `|` — preserves newlines as-is.
     literal,
+    /// `>` — folds newlines into spaces.
     folded,
 };
 
+/// Block scalar chomping indicator controlling trailing newlines.
 pub const ChompingStyle = enum {
+    /// Default: single trailing newline.
     clip,
+    /// `-` suffix: strip all trailing newlines.
     strip,
+    /// `+` suffix: keep all trailing newlines.
     keep,
 };
 

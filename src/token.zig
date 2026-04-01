@@ -1,5 +1,6 @@
 const std = @import("std");
 
+/// The type of a YAML token produced by the scanner.
 pub const TokenType = enum(u8) {
     document_header,
     document_end,
@@ -61,28 +62,40 @@ pub const Indicator = enum(u8) {
     reserved_backtick,
 };
 
+/// Source position of a token: line, column, byte offset, and indentation.
 pub const Position = struct {
+    /// 1-based line number.
     line: u32 = 1,
+    /// 1-based column number.
     column: u32 = 1,
+    /// 0-based byte offset into the source.
     offset: u32 = 0,
     indent_num: u32 = 0,
     indent_level: u32 = 0,
 };
 
+/// A single YAML token with its type, value, source position, and linked-list pointers.
 pub const Token = struct {
     token_type: TokenType,
+    /// The semantic value of the token (e.g. the string content, number text).
     value: []const u8 = "",
+    /// The original source text of the token (for round-trip fidelity).
     origin: []const u8 = "",
     position: Position = .{},
+    /// Next token in the linked list (set after scanning).
     next: ?*Token = null,
+    /// Previous token in the linked list (set after scanning).
     prev: ?*Token = null,
 };
 
+/// Result of parsing a numeric string: either an integer or a float.
 pub const NumberValue = union(enum) {
     int: i64,
     float: f64,
 };
 
+/// Parse a string as a YAML number (decimal, hex, octal, binary, or float).
+/// Returns null if the string is not a valid number.
 pub fn toNumber(val: []const u8) ?NumberValue {
     if (val.len == 0) return null;
 
@@ -173,6 +186,11 @@ fn parseFloat(s: []const u8, negative: bool) ?NumberValue {
     return .{ .float = if (negative) -f else f };
 }
 
+/// Check whether a string value needs quoting when emitted as YAML.
+///
+/// Returns true for empty strings, reserved keywords (null, true, false),
+/// numeric values, strings with leading/trailing whitespace, YAML indicator
+/// characters, colon patterns, timestamps, and legacy YAML 1.1 booleans.
 pub fn needsQuoting(val: []const u8) bool {
     if (val.len == 0) return true;
 
@@ -308,6 +326,8 @@ fn isOverflowNumber(val: []const u8) bool {
     return true;
 }
 
+/// Check if a string is a YAML 1.2 reserved keyword (null, true, false, .inf, .nan, etc).
+/// Returns the corresponding `TokenType` if it is, or null otherwise.
 pub fn reservedKeyword(val: []const u8) ?TokenType {
     if (val.len == 0) return null;
     switch (val[0]) {

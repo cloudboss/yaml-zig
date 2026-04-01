@@ -19,10 +19,15 @@ const ParseErr = error{
     OutOfMemory,
 };
 
+/// Low-level YAML parser that converts a token stream into AST nodes.
+///
+/// For most use cases, prefer the module-level `parse` and `parseAll` functions
+/// which handle scanning and linking automatically.
 pub const Parser = struct {
     allocator: Allocator,
     tokens: []const Token = &.{},
     pos: usize = 0,
+    /// Error detail from the last failed parse, if any.
     last_error: ?Detail = null,
     explicit_key_col: ?u32 = null,
 
@@ -1787,6 +1792,10 @@ pub const Parser = struct {
     }
 };
 
+/// Parse a YAML string into a single `Document`.
+///
+/// Scans, tokenizes, and parses `source` in one step. The returned document
+/// owns all memory via its arena; call `deinit()` to free.
 pub fn parse(allocator: Allocator, source: []const u8) !Document {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -1818,6 +1827,10 @@ pub fn parse(allocator: Allocator, source: []const u8) !Document {
     return Document{ .arena = arena, .body = body_ptr };
 }
 
+/// Parse a YAML string containing multiple `---`-separated documents into a `Stream`.
+///
+/// Each document is accessible via `stream.docs`. The returned stream owns all
+/// memory via its arena; call `deinit()` to free.
 pub fn parseAll(allocator: Allocator, source: []const u8) !ast.Stream {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();

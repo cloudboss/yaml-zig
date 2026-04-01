@@ -8,6 +8,10 @@ const TokenType = token_mod.TokenType;
 const Buf = std.ArrayListUnmanaged(u8);
 const LineBuf = std.ArrayListUnmanaged([]const u8);
 
+/// YAML tokenizer (lexer).
+///
+/// Breaks a YAML source string into a sequence of `Token`s. Uses an internal
+/// arena for all token storage; call `deinit()` to free.
 pub const Scanner = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -54,6 +58,7 @@ pub const Scanner = struct {
         return self.arena.allocator();
     }
 
+    /// Tokenize the source string into a slice of `Token`s.
     pub fn scan(self: *Scanner) ![]Token {
         while (self.pos < self.source.len) {
             try self.skipWhitespaceAndNewlines();

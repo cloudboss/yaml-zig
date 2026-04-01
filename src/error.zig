@@ -5,12 +5,19 @@ const testing = std.testing;
 const parser = @import("parser.zig");
 const token = @import("token.zig");
 
+/// Structured error detail with source position information.
+///
+/// Provides a human-readable message and the line/column where the error occurred,
+/// plus optional context (e.g. "while parsing block mapping" at an earlier position).
 pub const Detail = struct {
     message: []const u8 = "",
     position: ?token.Position = null,
+    /// Additional context message (e.g. "while parsing block mapping").
     context_message: []const u8 = "",
+    /// Position of the context (e.g. where the block mapping started).
     context_position: ?token.Position = null,
 
+    /// Format the error detail as a human-readable string.
     pub fn format(self: Detail, allocator: std.mem.Allocator) ![]u8 {
         if (self.context_message.len > 0) {
             if (self.context_position) |cp| {
@@ -38,6 +45,7 @@ pub const Detail = struct {
     }
 };
 
+/// Errors produced during tokenization (scanning).
 pub const ScanError = error{
     InvalidYaml,
     InvalidUtf8,
@@ -47,6 +55,7 @@ pub const ScanError = error{
     TabInIndent,
 };
 
+/// Errors produced during AST parsing.
 pub const ParseError = error{
     SyntaxError,
     UnexpectedToken,
@@ -54,6 +63,7 @@ pub const ParseError = error{
     MaxDepthExceeded,
 };
 
+/// Errors produced when decoding YAML nodes into Zig types.
 pub const DecodeError = error{
     TypeMismatch,
     Overflow,
@@ -62,6 +72,7 @@ pub const DecodeError = error{
     InvalidAnchor,
 };
 
+/// Errors produced during YAML serialization.
 pub const EncodeError = error{
     UnsupportedType,
     InvalidValue,

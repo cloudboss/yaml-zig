@@ -7,15 +7,32 @@ const Node = @import("ast.zig").Node;
 const Value = @import("value.zig").Value;
 const token = @import("token.zig");
 
+/// Options controlling YAML serialization output format.
 pub const StringifyOptions = struct {
+    /// Number of spaces per indentation level. Default: 2.
     indent: u8 = 2,
+    /// When true, emit all mappings and sequences in flow (inline JSON-like) style
+    /// rather than block style. Default: false.
     flow_style: bool = false,
+    /// When true, emit multi-line strings as YAML literal block scalars (`|`)
+    /// instead of quoted strings. Default: false.
     use_literal_multiline: bool = false,
+    /// When true, prefer single-quoted strings over double-quoted strings
+    /// where possible (falls back to double quotes when escape sequences are needed).
+    /// Default: false.
     use_single_quote: bool = false,
+    /// When true, omit struct fields whose values are empty (empty strings, null
+    /// optionals, zero integers, false booleans, empty slices). Default: false.
     omit_empty: bool = false,
+    /// When true, indent sequence items one level deeper within their parent
+    /// mapping. Default: false.
     indent_sequence: bool = false,
 };
 
+/// Serialize a Zig value to a YAML string, returning an allocated slice.
+///
+/// The caller owns the returned memory and must free it with `allocator`.
+/// Appends a trailing newline if the output doesn't already end with one.
 pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
     var list = std.ArrayListUnmanaged(u8){};
     errdefer list.deinit(allocator);
@@ -27,6 +44,7 @@ pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOpti
     return list.toOwnedSlice(allocator);
 }
 
+/// Serialize a Zig value as YAML, writing directly to `writer`.
 pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void {
     try writeValue(@TypeOf(val), writer, val, 0, options, false);
 }

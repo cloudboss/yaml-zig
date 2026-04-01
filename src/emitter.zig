@@ -7,8 +7,11 @@ const Node = ast.Node;
 const parser = @import("parser.zig");
 const token = @import("token.zig");
 
+/// Options for AST-to-YAML emission.
 pub const EmitOptions = struct {
+    /// Number of spaces per indentation level. Default: 2.
     indent: u8 = 2,
+    /// When true, emit mappings and sequences in flow (inline) style. Default: false.
     flow_style: bool = false,
 };
 
@@ -25,6 +28,10 @@ const Writer = struct {
     }
 };
 
+/// Emit an AST node back to a YAML string.
+///
+/// Performs a round-trip-safe serialization: comments, document markers, and
+/// block scalar styles are preserved. The caller owns the returned slice.
 pub fn emit(allocator: Allocator, node: Node, options: EmitOptions) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);

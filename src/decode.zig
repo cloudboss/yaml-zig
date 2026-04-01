@@ -9,16 +9,27 @@ const scanner = @import("scanner.zig");
 const token = @import("token.zig");
 const Value = @import("value.zig").Value;
 
+/// Options controlling how YAML is decoded into Zig types.
 pub const ParseOptions = struct {
+    /// When true, YAML keys that don't match any struct field are silently
+    /// skipped. When false, an `UnknownField` error is returned. Default: true.
     ignore_unknown_fields: bool = true,
+    /// Maximum nesting depth for YAML structures. Exceeding this limit returns
+    /// a `MaxDepthExceeded` error. Default: 10,000.
     max_depth: u32 = 10_000,
 };
 
+/// Result of decoding YAML into a Zig type `T`.
+///
+/// Owns all allocated memory (strings, slices) via an internal arena.
+/// Call `deinit()` to release everything when done.
 pub fn Parsed(comptime T: type) type {
     return struct {
         arena: *std.heap.ArenaAllocator,
+        /// The decoded value.
         value: T,
 
+        /// Free all memory owned by this parsed result.
         pub fn deinit(self: @This()) void {
             const child_allocator = self.arena.child_allocator;
             self.arena.deinit();
@@ -27,6 +38,11 @@ pub fn Parsed(comptime T: type) type {
     };
 }
 
+/// Decode a YAML string into a Zig type `T`.
+///
+/// Parses `source` as YAML and maps it onto `T`, which may be a struct,
+/// optional, slice, integer, float, bool, string (`[]const u8`), or `Value`.
+/// Returns a `Parsed(T)` that owns all allocated memory.
 pub fn decode(
     comptime T: type,
     allocator: Allocator,
