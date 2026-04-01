@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: make build
+      - run: make test
+
+  docs:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: make docs
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _output/zig-out/docs
+      - id: deploy
+        uses: actions/deploy-pages@v5
