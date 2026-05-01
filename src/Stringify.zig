@@ -686,7 +686,7 @@ fn isEmptyValue(comptime T: type, val: T) bool {
     }
 }
 
-fn writeValueUnion(
+pub fn writeValueUnion(
     writer: *std.Io.Writer,
     val: Value,
     depth: u32,
@@ -864,7 +864,7 @@ fn writeFlowStruct(
     try writer.writeByte('}');
 }
 
-fn writeFlowValueUnion(writer: *std.Io.Writer, val: Value, options: Options) !void {
+pub fn writeFlowValueUnion(writer: *std.Io.Writer, val: Value, options: Options) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),

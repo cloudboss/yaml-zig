@@ -2,6 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+const decoder = @import("decode.zig");
+const Stringify = @import("Stringify.zig");
+const ast = @import("ast.zig");
+const ParseOptions = @import("static.zig").ParseOptions;
+
 /// A dynamically typed YAML value.
 ///
 /// Represents any YAML scalar, sequence, or mapping without requiring a
@@ -78,6 +83,44 @@ pub const Value = union(enum) {
                 break :blk true;
             },
         };
+    }
+
+    /// Write a YAML representation of `self` to `writer`. Useful for
+    /// debug printing.
+    pub fn dump(self: Value, writer: *std.Io.Writer) Stringify.Error!void {
+        try Stringify.value(self, .{}, writer);
+    }
+
+    /// Decode an AST node into a `Value`. Custom hook for the type, called
+    /// automatically when `T == Value` is the parse target.
+    pub fn yamlParse(
+        allocator: Allocator,
+        node: ast.Node,
+        options: ParseOptions,
+    ) !Value {
+        var anchors = decoder.AnchorMap.init(allocator);
+        defer anchors.deinit();
+        return decoder.decodeToValue(allocator, node, options, &anchors);
+    }
+
+    /// Identity decode for `Value`. Performs a deep clone so the result
+    /// owns its own memory.
+    pub fn yamlParseFromValue(
+        allocator: Allocator,
+        source: Value,
+        options: ParseOptions,
+    ) !Value {
+        _ = options;
+        return decoder.cloneValue(allocator, source);
+    }
+
+    /// Emit `self` as YAML through the streaming Stringify writer. Honors
+    /// the writer's `flow_style` option.
+    pub fn yamlStringify(self: Value, s: *Stringify) !void {
+        if (s.options.flow_style) {
+            return Stringify.writeFlowValueUnion(s.writer, self, s.options);
+        }
+        return Stringify.writeValueUnion(s.writer, self, s.indent_level, s.options);
     }
 };
 
