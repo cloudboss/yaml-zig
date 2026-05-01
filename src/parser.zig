@@ -5,7 +5,7 @@ const testing = std.testing;
 const ast = @import("ast.zig");
 const Document = ast.Document;
 const Node = ast.Node;
-const Detail = @import("error.zig").Detail;
+const Diagnostics = @import("error.zig").Diagnostics;
 const scanner = @import("scanner.zig");
 const token = @import("token.zig");
 const Token = token.Token;
@@ -27,8 +27,8 @@ pub const Parser = struct {
     allocator: Allocator,
     tokens: []const Token = &.{},
     pos: usize = 0,
-    /// Error detail from the last failed parse, if any.
-    last_error: ?Detail = null,
+    /// Diagnostics from the last failed parse, if any.
+    last_error: ?Diagnostics = null,
     explicit_key_col: ?u32 = null,
 
     pub fn init(allocator: Allocator) Parser {
@@ -101,7 +101,7 @@ pub const Parser = struct {
         return Node{ .document = .{} };
     }
 
-    pub fn lastError(self: *const Parser) ?Detail {
+    pub fn lastError(self: *const Parser) ?Diagnostics {
         return self.last_error;
     }
 

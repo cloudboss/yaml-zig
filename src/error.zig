@@ -5,11 +5,11 @@ const testing = std.testing;
 const parser = @import("parser.zig");
 const token = @import("token.zig");
 
-/// Structured error detail with source position information.
+/// Structured diagnostic information attached to a parse error.
 ///
 /// Provides a human-readable message and the line/column where the error occurred,
 /// plus optional context (e.g. "while parsing block mapping" at an earlier position).
-pub const Detail = struct {
+pub const Diagnostics = struct {
     message: []const u8 = "",
     position: ?token.Position = null,
     /// Additional context message (e.g. "while parsing block mapping").
@@ -17,8 +17,8 @@ pub const Detail = struct {
     /// Position of the context (e.g. where the block mapping started).
     context_position: ?token.Position = null,
 
-    /// Format the error detail as a human-readable string.
-    pub fn format(self: Detail, allocator: std.mem.Allocator) ![]u8 {
+    /// Format the diagnostics as a human-readable string.
+    pub fn format(self: Diagnostics, allocator: std.mem.Allocator) ![]u8 {
         if (self.context_message.len > 0) {
             if (self.context_position) |cp| {
                 return std.fmt.allocPrint(allocator,
@@ -78,12 +78,28 @@ pub const EncodeError = error{
     InvalidValue,
 };
 
+/// Concrete errors returned by `parseFromValue` / `parseFromValueLeaky`,
+/// or by any decoding path that walks an existing `Value` tree.
+pub const ParseFromValueError = error{
+    UnexpectedToken,
+    InvalidNumber,
+    InvalidEnumTag,
+    DuplicateField,
+    LengthMismatch,
+} ||
+    ParseError ||
+    DecodeError ||
+    ScanError ||
+    std.mem.Allocator.Error ||
+    std.fmt.ParseIntError ||
+    std.fmt.ParseFloatError;
+
 test "error detail has position for invalid yaml" {
     try testing.expectError(error.SyntaxError, parser.parse(testing.allocator, ":\n  :\n    :"));
 }
 
 test "error detail format produces readable message" {
-    const detail = Detail{
+    const detail = Diagnostics{
         .message = "unexpected token",
         .position = .{
             .line = 3,
@@ -99,7 +115,7 @@ test "error detail format produces readable message" {
 }
 
 test "error detail format includes line and column" {
-    const detail = Detail{
+    const detail = Diagnostics{
         .message = "bad indent",
         .position = .{
             .line = 10,
@@ -113,7 +129,7 @@ test "error detail format includes line and column" {
 }
 
 test "error detail format with context" {
-    const detail = Detail{
+    const detail = Diagnostics{
         .message = "unexpected mapping",
         .position = .{ .line = 5, .column = 1 },
         .context_message = "while parsing block",
