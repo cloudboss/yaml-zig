@@ -1,3 +1,6 @@
+//! YAML serialization. The static helpers `Stringify.value` and
+//! `Stringify.valueAlloc` are the usual entry points.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -8,7 +11,7 @@ const Value = @import("dynamic.zig").Value;
 const token = @import("token.zig");
 
 /// Options controlling YAML serialization output format.
-pub const StringifyOptions = struct {
+pub const Options = struct {
     /// Number of spaces per indentation level. Default: 2.
     indent: u8 = 2,
     /// When true, emit all mappings and sequences in flow (inline JSON-like) style
@@ -29,11 +32,16 @@ pub const StringifyOptions = struct {
     indent_sequence: bool = false,
 };
 
+/// Serialize a Zig value as YAML, writing directly to `writer`.
+pub fn value(val: anytype, options: Options, writer: anytype) !void {
+    try writeValue(@TypeOf(val), writer, val, 0, options, false);
+}
+
 /// Serialize a Zig value to a YAML string, returning an allocated slice.
 ///
 /// The caller owns the returned memory and must free it with `allocator`.
 /// Appends a trailing newline if the output doesn't already end with one.
-pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
+pub fn valueAlloc(allocator: Allocator, val: anytype, options: Options) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -44,18 +52,6 @@ pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOpti
     }
     var list = aw.toArrayList();
     return list.toOwnedSlice(allocator);
-}
-
-/// Serialize a Zig value as YAML, writing directly to `writer`.
-pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void {
-    try writeValue(@TypeOf(val), writer, val, 0, options, false);
-}
-
-pub fn encodeToNode(allocator: Allocator, val: anytype, options: StringifyOptions) !Node {
-    _ = allocator;
-    _ = val;
-    _ = options;
-    return error.Unimplemented;
 }
 
 fn writeIndent(writer: anytype, depth: u32, indent_size: u8) !void {
@@ -70,7 +66,7 @@ fn writeValue(
     writer: anytype,
     val: T,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
     flow: bool,
 ) !void {
     const ti = @typeInfo(T);
@@ -191,7 +187,7 @@ fn writeStringValue(
     writer: anytype,
     val: []const u8,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     // Detect line ending type.
     const line_end = detectLineEnding(val);
@@ -241,7 +237,7 @@ fn writeBlockScalar(
     writer: anytype,
     val: []const u8,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
     line_end: LineEnding,
 ) !void {
     const sep: []const u8 = switch (line_end) {
@@ -333,7 +329,7 @@ fn writeSlice(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     writeSliceInner(Child, writer, val, depth, options, true) catch |err| return err;
 }
@@ -343,7 +339,7 @@ fn writeSliceTop(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     writeSliceInner(Child, writer, val, depth, options, false) catch |err| return err;
 }
@@ -353,7 +349,7 @@ fn writeSliceInner(
     writer: anytype,
     val: []const Child,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
     prefix_first: bool,
 ) !void {
     if (val.len == 0) {
@@ -376,7 +372,7 @@ fn writeStruct(
     writer: anytype,
     val: T,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     if (s.fields.len == 0) {
         try writer.writeAll("{}");
@@ -403,7 +399,7 @@ fn writeFieldValue(
     writer: anytype,
     val: T,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     const ti = @typeInfo(T);
     if (ti == .@"struct") {
@@ -510,7 +506,7 @@ fn writeValueUnion(
     writer: anytype,
     val: Value,
     depth: u32,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
@@ -594,7 +590,7 @@ fn writeFlowValue(
     comptime T: type,
     writer: anytype,
     val: T,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     const ti = @typeInfo(T);
     switch (ti) {
@@ -647,7 +643,7 @@ fn writeFlowSlice(
     comptime Child: type,
     writer: anytype,
     val: []const Child,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     if (val.len == 0) {
         try writer.writeAll("[]");
@@ -666,7 +662,7 @@ fn writeFlowStruct(
     comptime T: type,
     writer: anytype,
     val: T,
-    options: StringifyOptions,
+    options: Options,
 ) !void {
     if (s.fields.len == 0) {
         try writer.writeAll("{}");
@@ -684,7 +680,7 @@ fn writeFlowStruct(
     try writer.writeByte('}');
 }
 
-fn writeFlowValueUnion(writer: anytype, val: Value, options: StringifyOptions) !void {
+fn writeFlowValueUnion(writer: anytype, val: Value, options: Options) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
@@ -722,15 +718,15 @@ fn writeFlowValueUnion(writer: anytype, val: Value, options: StringifyOptions) !
 }
 
 fn testEncode(val: anytype) ![]u8 {
-    return stringifyAlloc(testing.allocator, val, .{});
+    return valueAlloc(testing.allocator, val, .{});
 }
 
-fn testEncodeOpts(val: anytype, opts: StringifyOptions) ![]u8 {
-    return stringifyAlloc(testing.allocator, val, opts);
+fn testEncodeOpts(val: anytype, opts: Options) ![]u8 {
+    return valueAlloc(testing.allocator, val, opts);
 }
 
-fn testEncodeWithOptions(val: anytype, opts: StringifyOptions) ![]u8 {
-    return stringifyAlloc(testing.allocator, val, opts);
+fn testEncodeWithOptions(val: anytype, opts: Options) ![]u8 {
+    return valueAlloc(testing.allocator, val, opts);
 }
 
 fn buildArray(allocator: Allocator, items: []const Value) !Value.Array {

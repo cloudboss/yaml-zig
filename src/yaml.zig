@@ -19,7 +19,7 @@
 //!
 //! **Serialization** — encode Zig values back to YAML:
 //! ```zig
-//! const output = try yaml.stringifyAlloc(allocator, my_struct, .{});
+//! const output = try yaml.Stringify.valueAlloc(allocator, my_struct, .{});
 //! defer allocator.free(output);
 //! ```
 
@@ -28,7 +28,6 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const decoder = @import("decode.zig");
-const encoder = @import("encode.zig");
 
 /// Abstract syntax tree types for YAML documents.
 pub const ast = @import("ast.zig");
@@ -46,6 +45,8 @@ pub const suite = @import("suite.zig");
 pub const token = @import("token.zig");
 /// Dynamic YAML value type.
 pub const dynamic = @import("dynamic.zig");
+/// YAML serialization. See `Stringify.value` and `Stringify.valueAlloc`.
+pub const Stringify = @import("Stringify.zig");
 
 /// A parsed YAML document with an optional AST body node.
 pub const Document = ast.Document;
@@ -60,8 +61,6 @@ pub const ParseOptions = decoder.ParseOptions;
 /// The result of decoding YAML into a Zig type `T`. Owns all allocated memory
 /// via an internal arena. Call `deinit()` to free.
 pub const Parsed = decoder.Parsed;
-/// Options for `stringifyAlloc` and `stringify`. See `StringifyOptions` for field details.
-pub const StringifyOptions = encoder.StringifyOptions;
 
 /// Decode a YAML string into a Zig type `T`.
 ///
@@ -116,20 +115,6 @@ pub fn parseFromValueLeaky(
     return decoder.decodeFromValueLeaky(T, allocator, source, options);
 }
 
-/// Serialize a Zig value to a YAML string.
-///
-/// The caller owns the returned slice and must free it with `allocator`.
-/// See `StringifyOptions` for output format configuration.
-pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
-    return encoder.stringifyAlloc(allocator, val, options);
-}
-
-/// Serialize a Zig value as YAML, writing to `writer`.
-/// See `StringifyOptions` for output format configuration.
-pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void {
-    return encoder.stringify(val, options, writer);
-}
-
 test {
     _ = token;
     _ = ast;
@@ -139,7 +124,7 @@ test {
     _ = parser;
     _ = emitter;
     _ = decoder;
-    _ = encoder;
+    _ = Stringify;
     _ = suite;
 }
 
@@ -240,7 +225,7 @@ test "parseFromValue identity for Value clones" {
     src_arena = std.heap.ArenaAllocator.init(testing.allocator);
 }
 
-test "full pipeline parseFromSlice stringifyAlloc" {
+test "full pipeline parseFromSlice Stringify.valueAlloc" {
     const Config = struct {
         name: []const u8,
         port: u16,
@@ -254,7 +239,7 @@ test "full pipeline parseFromSlice stringifyAlloc" {
     defer parsed.deinit();
     try testing.expectEqualStrings("myapp", parsed.value.name);
     try testing.expectEqual(@as(u16, 3000), parsed.value.port);
-    const output = try stringifyAlloc(testing.allocator, parsed.value, .{});
+    const output = try Stringify.valueAlloc(testing.allocator, parsed.value, .{});
     defer testing.allocator.free(output);
     try testing.expectEqualStrings(input, output);
 }
