@@ -2499,7 +2499,7 @@ test "scan json style mapping" {
 
 test "scan explicit typed map" {
     try expectTokenTypesAndValues(
-        std.mem.trimRight(u8,
+        std.mem.trimEnd(u8,
             \\!!map {
             \\  ? !!str "explicit":!!str "entry",
             \\  ? !!str "implicit" : !!str "entry",

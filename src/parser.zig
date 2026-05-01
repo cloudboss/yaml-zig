@@ -142,7 +142,7 @@ pub const Parser = struct {
     }
 
     fn collectComments(self: *Parser) !?*const ast.CommentGroupNode {
-        var comments = std.ArrayListUnmanaged(*const ast.CommentNode){};
+        var comments = std.ArrayListUnmanaged(*const ast.CommentNode).empty;
         while (self.pos < self.tokens.len and
             self.tokens[self.pos].token_type == .comment)
         {
@@ -186,7 +186,7 @@ pub const Parser = struct {
     ) !?*const ast.CommentGroupNode {
         if (a == null) return b;
         if (b == null) return a;
-        var all = std.ArrayListUnmanaged(*const ast.CommentNode){};
+        var all = std.ArrayListUnmanaged(*const ast.CommentNode).empty;
         for (a.?.comments) |c| try all.append(self.allocator, c);
         for (b.?.comments) |c| try all.append(self.allocator, c);
         const group = try self.createNode(Node{ .comment_group = .{
@@ -856,7 +856,7 @@ pub const Parser = struct {
         min_indent: u32,
         first_comment: ?*const ast.CommentGroupNode,
     ) ParseErr!*Node {
-        var entries = std.ArrayListUnmanaged(*const ast.MappingValueNode){};
+        var entries = std.ArrayListUnmanaged(*const ast.MappingValueNode).empty;
         var key_set = std.StringHashMap(void).init(self.allocator);
 
         // Add first entry and check for dup.
@@ -1059,7 +1059,7 @@ pub const Parser = struct {
             return null;
 
         const seq_col = self.tokens[self.pos].position.column;
-        var items = std.ArrayListUnmanaged(*const Node){};
+        var items = std.ArrayListUnmanaged(*const Node).empty;
 
         while (self.pos < self.tokens.len) {
             self.skipComments();
@@ -1122,7 +1122,7 @@ pub const Parser = struct {
     fn parseFlowMapping(self: *Parser) ParseErr!*Node {
         const open_tok = &self.tokens[self.pos];
         self.advance(); // Consume '{'.
-        var entries = std.ArrayListUnmanaged(*const ast.MappingValueNode){};
+        var entries = std.ArrayListUnmanaged(*const ast.MappingValueNode).empty;
 
         while (self.pos < self.tokens.len) {
             self.skipComments();
@@ -1232,7 +1232,7 @@ pub const Parser = struct {
     fn parseFlowSequence(self: *Parser) ParseErr!*Node {
         const open_tok = &self.tokens[self.pos];
         self.advance(); // Consume '['.
-        var items = std.ArrayListUnmanaged(*const Node){};
+        var items = std.ArrayListUnmanaged(*const Node).empty;
 
         while (self.pos < self.tokens.len) {
             self.skipComments();
@@ -1839,7 +1839,7 @@ pub fn parseAll(allocator: Allocator, source: []const u8) !ast.Stream {
     var s = scanner.Scanner.init(arena_alloc, source);
     const tokens = try s.scan();
 
-    var docs = std.ArrayListUnmanaged(Document){};
+    var docs = std.ArrayListUnmanaged(Document).empty;
     var doc_start: usize = 0;
     var i: usize = 0;
     var found_header = false;
