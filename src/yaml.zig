@@ -1,8 +1,37 @@
-//! A YAML 1.2 parser and serializer for Zig.
+//! A YAML 1.2 parser and serializer for Zig. The API follows a style
+//! similar to `std.json` as much as possible.
 //!
-//! Provides two main workflows:
+//! For parsing, there are four main entry points that come in two flavors:
+//! those that return a `Parsed`(`T`), and "leaky" variants that return `T`.
+//! The leaky variants use the caller's allocator, while the `Parsed`(`T`)
+//! variants contain an internal arena and have `deinit` methods.
 //!
-//! **Typed parsing** — decode YAML directly into Zig structs and types:
+//! Serialization goes through a `Stringify` writer with both whole-value
+//! helpers and a streaming method API.
+//!
+//! Where YAML differs from JSON, the API diverges to match YAML
+//! semantics. The most visible divergence is `Value.ObjectMap`, which
+//! keeps YAML's allowance of non-string mapping keys.
+//!
+//! Custom types may implement `yamlParse`, `yamlParseFromValue`, and
+//! `yamlStringify` (see `Hooks` below).
+//!
+//! ## Parsing
+//!
+//! Four entry points cover the common cases:
+//!
+//! - `parseFromSlice(T, allocator, source, options)`: Allocates a result
+//!   arena alongside the decoded value and returns a `Parsed`(`T`). Call
+//!   `parsed.deinit()` to free everything.
+//! - `parseFromSliceLeaky(T, allocator, source, options)`: Decodes into
+//!   the caller's allocator without an internal arena. Pair it with an
+//!   `ArenaAllocator` if you want a single point of cleanup.
+//! - `parseFromValue(T, allocator, source, options)`: Decodes a Value
+//!   the caller already has. Returns a `Parsed`(`T`) whose arena owns
+//!   deep-cloned data, so the source `Value` can be released independently.
+//! - `parseFromValueLeaky(T, allocator, source, options)`: The same path
+//!   as `parseFromValue` without the arena wrapper.
+//!
 //! ```zig
 //! const Config = struct { name: []const u8, port: u16 };
 //! const parsed = try yaml.parseFromSlice(Config, allocator, input, .{});
@@ -10,28 +39,105 @@
 //! std.debug.print("{s}:{d}\n", .{ parsed.value.name, parsed.value.port });
 //! ```
 //!
-//! **AST parsing** — get a full syntax tree for round-trip editing:
+//! To decode with an arena owned by the caller:
+//!
+//! ```zig
+//! var arena = std.heap.ArenaAllocator.init(gpa);
+//! defer arena.deinit();
+//! const cfg = try yaml.parseFromSliceLeaky(Config, arena.allocator(), input, .{});
+//! ```
+//!
+//! `T` may be `Value` to decode without committing to a static schema.
+//! `Value` itself implements hooks, so it follows the the same parse
+//! and stringify paths.
+//!
+//! ## Serialization
+//!
+//! `Stringify.value(val, options, writer)` writes any value as a YAML string
+//! to a `std.Io.Writer`.
+//!
+//! `Stringify.valueAlloc(allocator, val, options)` returns an owned slice
+//! instead.
+//!
+//! Both honor `Stringify.Options` for indent width, flow versus block style,
+//! and other knobs.
+//!
+//! ```zig
+//! const out = try yaml.Stringify.valueAlloc(allocator, my_struct, .{});
+//! defer allocator.free(out);
+//! ```
+//!
+//! For incremental emission from inside a hook, construct a
+//! `Stringify` with `Stringify.init(writer, options)` and call
+//! `beginObject`, `objectField`, `write`, `print`, `beginArray`,
+//! `endArray`, and `endObject`.
+//!
+//! `yaml.fmt(value, options)` returns a small wrapper that formats as
+//! YAML when passed through `{f}` to `std.fmt`.
+//!
+//! ## Hooks
+//!
+//! A user type can take control of how it is parsed and serialized by
+//! declaring any of:
+//!
+//! ```zig
+//! pub fn yamlParse(allocator: Allocator, node: yaml.Node, options: yaml.ParseOptions) !@This()
+//! pub fn yamlParseFromValue(allocator: Allocator, source: yaml.Value, options: yaml.ParseOptions) !@This()
+//! pub fn yamlStringify(self: @This(), s: *yaml.Stringify) !void
+//! ```
+//!
+//! `yamlParse` runs when the value is reached during AST decoding.
+//! `yamlParseFromValue` runs during `Value` decoding. Inside these,
+//! call `innerParse` or `innerParseFromValue` to recurse
+//! on a sub-`Node` or sub-`Value`.
+//!
+//! `yamlStringify` runs when the encoder reaches the value. Inside this,
+//! use the streaming methods on the `Stringify` argument to emit YAML.
+//!
+//! ## YAML-specific extensions
+//!
+//! The features that have no JSON counterpart sit under the AST and
+//! parser modules and stay unchanged from earlier versions of this
+//! library:
+//!
+//! - Multi-document streams. Use `yaml.parser.parseAll` to get a
+//!   `yaml.Stream` of documents.
+//! - Anchors and aliases (`&` and `*`). The decoder resolves these
+//!   automatically.
+//! - Comment-preserving emission. The AST module retains comments and
+//!   `yaml.emitter.emit` produces a round-trip rendering.
+//!
+//! For working with the AST directly:
+//!
 //! ```zig
 //! var doc = try yaml.parser.parse(allocator, input);
 //! defer doc.deinit();
 //! const output = try yaml.emitter.emit(allocator, doc.body.?.*, .{});
-//! ```
-//!
-//! **Serialization** — encode Zig values back to YAML:
-//! ```zig
-//! const output = try yaml.Stringify.valueAlloc(allocator, my_struct, .{});
-//! defer allocator.free(output);
 //! ```
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-const decoder = @import("decode.zig");
-const static = @import("static.zig");
-
+/// String-keyed hash map of `T` values that round-trips through a YAML
+/// mapping. Use as a struct field for YAML inputs whose keys are
+/// arbitrary strings and whose values share one type.
+pub const ArrayHashMap = @import("hashmap.zig").ArrayHashMap;
 /// Abstract syntax tree types for YAML documents.
 pub const ast = @import("ast.zig");
+/// A parsed YAML document with an optional AST body node.
+pub const Document = ast.Document;
+/// A tagged union representing any YAML AST node.
+pub const Node = ast.Node;
+/// A stream of multiple YAML documents parsed from a single input.
+pub const Stream = ast.Stream;
+const decoder = @import("decode.zig");
+pub const innerParse = decoder.innerParse;
+pub const innerParseFromValue = decoder.innerParseFromValue;
+/// Dynamic YAML value type.
+pub const dynamic = @import("dynamic.zig");
+/// A dynamically typed YAML value (null, bool, int, float, string, array, or object).
+pub const Value = dynamic.Value;
 /// AST-to-YAML emitter for round-trip output.
 pub const emitter = @import("emitter.zig");
 /// Error types and diagnostic details.
@@ -40,39 +146,22 @@ pub const err = @import("error.zig");
 pub const parser = @import("parser.zig");
 /// YAML tokenizer (lexer).
 pub const scanner = @import("scanner.zig");
-/// YAML test suite runner.
-pub const suite = @import("suite.zig");
-/// Token types and utility functions.
-pub const token = @import("token.zig");
-/// Dynamic YAML value type.
-pub const dynamic = @import("dynamic.zig");
-/// YAML serialization. See `Stringify.value` and `Stringify.valueAlloc`.
-pub const Stringify = @import("Stringify.zig");
-
-/// A parsed YAML document with an optional AST body node.
-pub const Document = ast.Document;
-/// A tagged union representing any YAML AST node.
-pub const Node = ast.Node;
-/// A stream of multiple YAML documents parsed from a single input.
-pub const Stream = ast.Stream;
-/// A dynamically typed YAML value (null, bool, int, float, string, array, or object).
-pub const Value = dynamic.Value;
+const static = @import("static.zig");
 /// Options for `parseFromSlice`. See `ParseOptions` for field details.
 pub const ParseOptions = static.ParseOptions;
 /// The result of decoding YAML into a Zig type `T`. Owns all allocated memory
 /// via an internal arena. Call `deinit()` to free.
 pub const Parsed = static.Parsed;
-
 pub const parseFromSlice = static.parseFromSlice;
 pub const parseFromSliceLeaky = static.parseFromSliceLeaky;
 pub const parseFromValue = static.parseFromValue;
 pub const parseFromValueLeaky = static.parseFromValueLeaky;
-pub const innerParse = decoder.innerParse;
-pub const innerParseFromValue = decoder.innerParseFromValue;
-
-/// Generic hash map wrapper that round-trips through YAML mappings with
-/// string keys. See `hashmap.zig`.
-pub const ArrayHashMap = @import("hashmap.zig").ArrayHashMap;
+/// YAML serialization. See `Stringify.value` and `Stringify.valueAlloc`.
+pub const Stringify = @import("Stringify.zig");
+/// YAML test suite runner.
+pub const suite = @import("suite.zig");
+/// Token types and utility functions.
+pub const token = @import("token.zig");
 
 /// Build a value that formats `value` as YAML when used with `{f}` in
 /// any std.fmt printing function. The returned wrapper carries the
