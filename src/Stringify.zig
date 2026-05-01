@@ -145,8 +145,12 @@ pub fn beginObject(self: *Stringify) Error!void {
 
 /// Close the current object.
 pub fn endObject(self: *Stringify) Error!void {
+    // An empty object emits the inline form "{}". When state is still
+    // .container_start, the caller never wrote a field.
+    const was_empty = self.state == .container_start;
     self.popContainer(.object);
     if (self.indent_level > 0) self.indent_level -= 1;
+    if (was_empty) try self.writer.writeAll("{}");
     self.state = self.stateAfterPop();
 }
 
@@ -173,8 +177,12 @@ pub fn beginArray(self: *Stringify) Error!void {
 
 /// Close the current array.
 pub fn endArray(self: *Stringify) Error!void {
+    // An empty array emits the inline form "[]". When state is still
+    // .container_start, the caller never wrote an item.
+    const was_empty = self.state == .container_start;
     self.popContainer(.array);
     if (self.indent_level > 0) self.indent_level -= 1;
+    if (was_empty) try self.writer.writeAll("[]");
     self.state = self.stateAfterPop();
 }
 

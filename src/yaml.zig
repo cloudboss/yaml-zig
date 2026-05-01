@@ -70,6 +70,10 @@ pub const parseFromValueLeaky = static.parseFromValueLeaky;
 pub const innerParse = decoder.innerParse;
 pub const innerParseFromValue = decoder.innerParseFromValue;
 
+/// Generic hash map wrapper that round-trips through YAML mappings with
+/// string keys. See `hashmap.zig`.
+pub const ArrayHashMap = @import("hashmap.zig").ArrayHashMap;
+
 /// Build a value that formats `value` as YAML when used with `{f}` in
 /// any std.fmt printing function. The returned wrapper carries the
 /// value and the Stringify options to apply.
@@ -105,6 +109,7 @@ test {
     _ = decoder;
     _ = static;
     _ = Stringify;
+    _ = @import("hashmap.zig");
     _ = suite;
 }
 
