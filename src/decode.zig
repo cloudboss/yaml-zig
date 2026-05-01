@@ -2958,6 +2958,37 @@ test "decode tagged bool False" {
     try testing.expect(!r.value);
 }
 
+test "decode tagged bool to Value" {
+    var r = try testDecode(Value, "!!bool yes");
+    defer r.deinit();
+    try testing.expect(r.value.bool);
+}
+
+test "decode tagged float to Value" {
+    var r = try testDecode(Value, "!!float '1.5'");
+    defer r.deinit();
+    try testing.expectApproxEqAbs(@as(f64, 1.5), r.value.float, 0.001);
+}
+
+test "decode tagged null to Value" {
+    var r = try testDecode(Value, "!!null ''");
+    defer r.deinit();
+    try testing.expectEqual(@as(std.meta.Tag(Value), .null), @as(std.meta.Tag(Value), r.value));
+}
+
+test "decode tagged str to Value" {
+    var r = try testDecode(Value, "!!str hello");
+    defer r.deinit();
+    try testing.expectEqualStrings("hello", r.value.string);
+}
+
+test "decode tagged binary to Value" {
+    // !!binary "SGVsbG8=" is base64 for "Hello".
+    var r = try testDecode(Value, "!!binary \"SGVsbG8=\"");
+    defer r.deinit();
+    try testing.expectEqualStrings("Hello", r.value.string);
+}
+
 test "single quote 1: 2" {
     var r = try testDecode(Value, "'1': '2'");
     defer r.deinit();
