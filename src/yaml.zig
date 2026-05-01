@@ -225,6 +225,65 @@ test "parseFromValue identity for Value clones" {
     src_arena = std.heap.ArenaAllocator.init(testing.allocator);
 }
 
+test "type with all three hooks round-trips" {
+    // A type whose YAML form is an array of two ints but whose Zig
+    // representation is a struct of named fields. Exercises yamlParse,
+    // yamlParseFromValue, and yamlStringify on a single type.
+    const Pair = struct {
+        x: i64,
+        y: i64,
+        pub fn yamlParse(
+            allocator: std.mem.Allocator,
+            node: Node,
+            options: ParseOptions,
+        ) !@This() {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const v = try decoder.decodeNode(Value, arena.allocator(), node, options);
+            return fromArray(v);
+        }
+        pub fn yamlParseFromValue(
+            _: std.mem.Allocator,
+            source: Value,
+            _: ParseOptions,
+        ) !@This() {
+            return fromArray(source);
+        }
+        pub fn yamlStringify(self: @This(), s: *Stringify) !void {
+            try s.beginArray();
+            try s.write(self.x);
+            try s.write(self.y);
+            try s.endArray();
+        }
+        fn fromArray(v: Value) !@This() {
+            if (v != .array or v.array.items.len != 2) return error.LengthMismatch;
+            const a = v.array.items[0];
+            const b = v.array.items[1];
+            if (a != .integer or b != .integer) return error.UnexpectedToken;
+            return .{ .x = a.integer, .y = b.integer };
+        }
+    };
+
+    // yamlStringify path
+    const out = try Stringify.valueAlloc(testing.allocator, Pair{ .x = 3, .y = 4 }, .{});
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("- 3\n- 4\n", out);
+
+    // yamlParse path (slice -> Pair)
+    const sliced = try parseFromSliceLeaky(Pair, testing.allocator, "[3, 4]", .{});
+    try testing.expectEqual(@as(i64, 3), sliced.x);
+    try testing.expectEqual(@as(i64, 4), sliced.y);
+
+    // yamlParseFromValue path (Value -> Pair)
+    var arr: Value.Array = .empty;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try arr.appendSlice(arena.allocator(), &.{ .{ .integer = 3 }, .{ .integer = 4 } });
+    const fv = try parseFromValueLeaky(Pair, testing.allocator, .{ .array = arr }, .{});
+    try testing.expectEqual(@as(i64, 3), fv.x);
+    try testing.expectEqual(@as(i64, 4), fv.y);
+}
+
 test "full pipeline parseFromSlice Stringify.valueAlloc" {
     const Config = struct {
         name: []const u8,
