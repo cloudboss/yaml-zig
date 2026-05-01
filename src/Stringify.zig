@@ -44,10 +44,12 @@ writer: *std.Io.Writer,
 options: Options = .{},
 indent_level: u32 = 0,
 state: State = .doc_start,
-container_stack: [max_nesting_depth]Container = undefined,
+/// Bitset tracking the kind of each open container (0 = object, 1 = array).
+/// The bit at `container_top - 1` is the current container.
+container_stack: [(max_nesting_depth + 7) / 8]u8 = @splat(0),
 container_top: u32 = 0,
 
-const Container = enum { object, array };
+const Container = enum(u1) { object = 0, array = 1 };
 
 const State = enum {
     /// Nothing emitted yet at this level.
@@ -97,20 +99,42 @@ fn writeIndentLevel(self: *Stringify) !void {
 }
 
 fn pushContainer(self: *Stringify, kind: Container) void {
-    std.debug.assert(self.container_top < self.container_stack.len);
-    self.container_stack[self.container_top] = kind;
+    std.debug.assert(self.container_top < max_nesting_depth);
+    const idx = self.container_top;
+    const byte = idx >> 3;
+    const bit = @as(u3, @intCast(idx & 7));
+    const mask: u8 = @as(u8, 1) << bit;
+    if (kind == .array) {
+        self.container_stack[byte] |= mask;
+    } else {
+        self.container_stack[byte] &= ~mask;
+    }
     self.container_top += 1;
 }
 
 fn popContainer(self: *Stringify, expected: Container) void {
     std.debug.assert(self.container_top > 0);
     self.container_top -= 1;
-    std.debug.assert(self.container_stack[self.container_top] == expected);
+    std.debug.assert(self.containerAt(self.container_top) == expected);
+}
+
+fn containerAt(self: *const Stringify, idx: u32) Container {
+    const byte = idx >> 3;
+    const bit = @as(u3, @intCast(idx & 7));
+    const set = (self.container_stack[byte] >> bit) & 1 == 1;
+    return if (set) .array else .object;
 }
 
 fn currentContainer(self: *const Stringify) ?Container {
     if (self.container_top == 0) return null;
-    return self.container_stack[self.container_top - 1];
+    return self.containerAt(self.container_top - 1);
+}
+
+fn stateAfterPop(self: *const Stringify) State {
+    return switch (self.currentContainer() orelse return .doc_start) {
+        .object => .in_object,
+        .array => .in_array,
+    };
 }
 
 /// Open a YAML mapping (object) at the current cursor position.
@@ -124,7 +148,7 @@ pub fn beginObject(self: *Stringify) Error!void {
 pub fn endObject(self: *Stringify) Error!void {
     self.popContainer(.object);
     if (self.indent_level > 0) self.indent_level -= 1;
-    self.state = .in_object;
+    self.state = self.stateAfterPop();
 }
 
 /// Emit `name:` as the next object field. Must be called inside an object.
@@ -152,7 +176,7 @@ pub fn beginArray(self: *Stringify) Error!void {
 pub fn endArray(self: *Stringify) Error!void {
     self.popContainer(.array);
     if (self.indent_level > 0) self.indent_level -= 1;
-    self.state = .in_array;
+    self.state = self.stateAfterPop();
 }
 
 /// Write a value at the current cursor position. Dispatches by `@TypeOf(v)`:
@@ -3056,6 +3080,21 @@ test "Stringify array of strings" {
     try ys.write(@as([]const u8, "c"));
     try ys.endArray();
     try testing.expectEqualStrings("- a\n- b\n- c", aw.written());
+}
+
+test "Stringify array then sibling field in object" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var ys: Stringify = .init(&aw.writer, .{});
+    try ys.beginObject();
+    try ys.objectField("items");
+    try ys.beginArray();
+    try ys.write(@as(i64, 1));
+    try ys.endArray();
+    try ys.objectField("count");
+    try ys.write(@as(i64, 1));
+    try ys.endObject();
+    try testing.expectEqualStrings("items:\n  - 1\ncount: 1", aw.written());
 }
 
 test "Stringify array as object field value" {
