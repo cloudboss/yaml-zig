@@ -16,14 +16,43 @@ const static = @import("static.zig");
 const Stringify = @import("Stringify.zig");
 const Value = @import("dynamic.zig").Value;
 
+/// A hash map with string keys and `T` values that can be parsed from
+/// a YAML object and written back out as one.
+///
+/// Use this as a struct field when the YAML has a mapping whose keys
+/// are arbitrary strings (the names of environment variables, the
+/// names of jobs in a config, anything you do not know up front) and
+/// every value has the same type.
+///
+/// The actual map is stored in the `map` field. Items come out in the
+/// order they were added. Call `deinit` to free the map if it was not
+/// parsed into an arena.
+///
+/// Example:
+/// ```zig
+/// const Config = struct {
+///     name: []const u8,
+///     env: yaml.ArrayHashMap([]const u8),
+/// };
+/// const parsed = try yaml.parseFromSlice(Config, alloc, source, .{});
+/// defer parsed.deinit();
+/// const home = parsed.value.env.map.get("HOME").?;
+/// ```
 pub fn ArrayHashMap(comptime T: type) type {
     return struct {
+        /// The underlying map. Use the standard hash map methods
+        /// (`get`, `put`, `count`, `iterator`) to read and modify it.
         map: std.array_hash_map.String(T) = .empty,
 
+        /// Free the map's storage. Skip this if the map was parsed
+        /// into an arena that you free all at once.
         pub fn deinit(self: *@This(), allocator: Allocator) void {
             self.map.deinit(allocator);
         }
 
+        /// Parse hook called when this type is decoded from a YAML AST
+        /// node. The node must be a mapping. Every key must be a plain
+        /// string. Anything else returns `error.UnexpectedToken`.
         pub fn yamlParse(
             allocator: Allocator,
             node: ast.Node,
@@ -45,6 +74,11 @@ pub fn ArrayHashMap(comptime T: type) type {
             return result;
         }
 
+        /// Parse hook called when this type is decoded from a `Value`.
+        /// The Value must be an `.object`. Every key inside it must be
+        /// a `.string` Value. Anything else returns
+        /// `error.UnexpectedToken`. Useful when you already have a
+        /// `Value` and want a typed view.
         pub fn yamlParseFromValue(
             allocator: Allocator,
             source: Value,
@@ -62,6 +96,9 @@ pub fn ArrayHashMap(comptime T: type) type {
             return result;
         }
 
+        /// Stringify hook called when this type is written as YAML.
+        /// Writes one `key: value` line per entry, in the order the
+        /// entries were added.
         pub fn yamlStringify(self: @This(), s: *Stringify) !void {
             try s.beginObject();
             var it = self.map.iterator();
