@@ -178,6 +178,40 @@ pub fn endArray(self: *Stringify) Error!void {
     self.state = self.stateAfterPop();
 }
 
+/// Emit a formatted scalar at the current cursor position. Honors the same
+/// state-machine placement as `write`: an "- " prefix for array items, a
+/// leading space for an object-field value, and so on. The content comes
+/// from `std.fmt.format`, so use this for emitting computed scalar text
+/// from a `yamlStringify` hook.
+pub fn print(self: *Stringify, comptime fmt: []const u8, args: anytype) Error!void {
+    switch (self.state) {
+        .doc_start => {
+            try self.writer.print(fmt, args);
+        },
+        .after_field => {
+            try self.writer.writeByte(' ');
+            try self.writer.print(fmt, args);
+            self.state = .in_object;
+        },
+        .container_start => switch (self.currentContainer().?) {
+            .object => unreachable,
+            .array => {
+                try self.writeIndentLevel();
+                try self.writer.writeAll("- ");
+                try self.writer.print(fmt, args);
+                self.state = .in_array;
+            },
+        },
+        .in_array => {
+            try self.writer.writeByte('\n');
+            try self.writeIndentLevel();
+            try self.writer.writeAll("- ");
+            try self.writer.print(fmt, args);
+        },
+        .in_object => unreachable,
+    }
+}
+
 /// Write a value at the current cursor position. Dispatches by `@TypeOf(v)`:
 /// scalars are formatted directly, structs/slices/Value go through the same
 /// path as `value()`. After this call, the cursor is positioned right after
@@ -581,6 +615,18 @@ fn writeFieldValue(
     depth: u32,
     options: Options,
 ) !void {
+    if (comptime hasYamlStringify(T)) {
+        // The hook decides whether the value is a scalar (placed inline
+        // after "key: ") or a container (placed on the next line indented
+        // under the key). Setting state = .after_field lets the streaming
+        // API handle either case.
+        var s: Stringify = .init(writer, options);
+        s.indent_level = depth;
+        s.state = .after_field;
+        try writer.writeByte(':');
+        try val.yamlStringify(&s);
+        return;
+    }
     const ti = @typeInfo(T);
     if (ti == .@"struct") {
         const s = ti.@"struct";
@@ -3018,6 +3064,45 @@ test "encode indent sequence false" {
     const r = try testEncodeOpts(S{ .v = &.{ "A", "B" } }, .{ .indent_sequence = false });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("v:\n- A\n- B\n", r);
+}
+
+test "Stringify print inside yamlStringify hook" {
+    const Version = struct {
+        major: u8,
+        minor: u8,
+        patch: u8,
+        // Emit the version as a single dotted scalar through print.
+        pub fn yamlStringify(self: @This(), s: *Stringify) !void {
+            try s.print("{d}.{d}.{d}", .{ self.major, self.minor, self.patch });
+        }
+    };
+    const r = try valueAlloc(testing.allocator, Version{
+        .major = 1,
+        .minor = 2,
+        .patch = 3,
+    }, .{});
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings("1.2.3\n", r);
+}
+
+test "Stringify print inside object field" {
+    const Version = struct {
+        major: u8,
+        minor: u8,
+        pub fn yamlStringify(self: @This(), s: *Stringify) !void {
+            try s.print("{d}.{d}", .{ self.major, self.minor });
+        }
+    };
+    const Config = struct {
+        name: []const u8,
+        version: Version,
+    };
+    const r = try valueAlloc(testing.allocator, Config{
+        .name = "myapp",
+        .version = .{ .major = 1, .minor = 2 },
+    }, .{});
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings("name: myapp\nversion: 1.2\n", r);
 }
 
 test "Stringify object two fields" {
