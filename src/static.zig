@@ -12,11 +12,21 @@ const Value = @import("dynamic.zig").Value;
 
 /// Options controlling how YAML is decoded into Zig types.
 pub const ParseOptions = struct {
+    /// What to do when a YAML mapping has the same key twice. The default
+    /// is to fail; choose `.use_first` or `.use_last` to take one of the
+    /// duplicates instead.
+    duplicate_field_behavior: enum {
+        use_first,
+        @"error",
+        use_last,
+    } = .@"error",
+
     /// When true, YAML keys that don't match any struct field are silently
-    /// skipped. When false, an UnknownField error is returned. Default: true.
-    ignore_unknown_fields: bool = true,
+    /// dropped. When false (default), they cause an `UnknownField` error.
+    ignore_unknown_fields: bool = false,
+
     /// Maximum nesting depth for YAML structures. Exceeding this limit
-    /// returns a MaxDepthExceeded error.
+    /// returns a `MaxDepthExceeded` error.
     max_depth: u32 = 10_000,
 };
 
@@ -53,7 +63,7 @@ pub fn parseFromSlice(
     defer parse_arena.deinit();
     const parse_alloc = parse_arena.allocator();
 
-    const node_val = try decoder.parseToNode(parse_alloc, source);
+    const node_val = try decoder.parseToNode(parse_alloc, source, options);
 
     var parsed = Parsed(T){
         .arena = try allocator.create(std.heap.ArenaAllocator),
@@ -90,7 +100,7 @@ pub fn parseFromSliceLeaky(
     defer parse_arena.deinit();
     const parse_alloc = parse_arena.allocator();
 
-    const node_val = try decoder.parseToNode(parse_alloc, source);
+    const node_val = try decoder.parseToNode(parse_alloc, source, options);
     var anchors = decoder.AnchorMap.init(parse_alloc);
     return try decoder.decodeNodeInternal(T, allocator, node_val, options, &anchors);
 }

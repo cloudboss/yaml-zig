@@ -12,9 +12,9 @@ const Value = @import("dynamic.zig").Value;
 const static = @import("static.zig");
 pub const ParseOptions = static.ParseOptions;
 
-pub fn parseToNode(scratch: Allocator, source: []const u8) !Node {
+pub fn parseToNode(scratch: Allocator, source: []const u8, options: ParseOptions) !Node {
     const preprocessed = try preprocessYaml(scratch, source);
-    const root = try parseSource(scratch, preprocessed);
+    const root = try parseSource(scratch, preprocessed, options);
     return switch (root) {
         .document => |d| if (d.body) |b| b.* else Node{ .null_value = .{} },
         else => root,
@@ -32,13 +32,14 @@ fn scanAndParse(allocator: Allocator, source: []const u8) !Node {
     return p.parse(tokens);
 }
 
-fn parseSource(allocator: Allocator, source: []const u8) !Node {
+fn parseSource(allocator: Allocator, source: []const u8, options: ParseOptions) !Node {
     return scanAndParse(allocator, source) catch |e| {
-        // Duplicate keys: retry after removing earlier duplicates
-        // to implement "last wins" semantics.
         if (e == error.DuplicateKey) {
-            const deduped = try deduplicateKeys(allocator, source);
-            return scanAndParse(allocator, deduped);
+            return switch (options.duplicate_field_behavior) {
+                .@"error" => e,
+                .use_last => scanAndParse(allocator, try deduplicateKeys(allocator, source, .last)),
+                .use_first => scanAndParse(allocator, try deduplicateKeys(allocator, source, .first)),
+            };
         }
         return e;
     };
@@ -134,9 +135,14 @@ fn findNextLineIndent(source: []const u8, pos: usize) ?usize {
     return null;
 }
 
-fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
-    // Simple line-based deduplication for top-level mapping keys.
-    // Keeps the LAST occurrence of each key.
+const DuplicateKeep = enum { first, last };
+
+fn deduplicateKeys(
+    allocator: Allocator,
+    source: []const u8,
+    keep_which: DuplicateKeep,
+) ![]const u8 {
+    // Line-based deduplication for top-level mapping keys.
     var lines = std.ArrayListUnmanaged([]const u8).empty;
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     var start: usize = 0;
@@ -145,7 +151,6 @@ fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
             const end = if (c == '\n') idx else idx + 1;
             const line = source[start..end];
             try lines.append(allocator, line);
-            // Extract key from lines that start at column 0 with "key:".
             if (line.len > 0 and line[0] != ' ' and line[0] != '\t' and
                 line[0] != '-' and line[0] != '#')
             {
@@ -160,18 +165,24 @@ fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
             start = if (c == '\n') idx + 1 else end;
         }
     }
-    // Find duplicate keys and mark earlier occurrences for removal.
+    // Mark the duplicates to drop. For .last we drop the earlier ones; for
+    // .first we drop the later ones.
     var keep = try allocator.alloc(bool, lines.items.len);
     for (keep) |*k| k.* = true;
     for (keys.items, 0..) |key, idx| {
         if (key.len == 0) continue;
-        // Check if a later line has the same key.
         for (keys.items[idx + 1 ..], idx + 1..) |later_key, later_idx| {
             if (std.mem.eql(u8, key, later_key)) {
-                keep[idx] = false;
-                // Also remove continuation lines (indented) after the removed key.
-                var j = idx + 1;
-                while (j < lines.items.len and j < later_idx) {
+                const drop_idx = switch (keep_which) {
+                    .last => idx,
+                    .first => later_idx,
+                };
+                keep[drop_idx] = false;
+                // Also remove continuation lines (indented) after the dropped key.
+                const start_cont = drop_idx + 1;
+                const end_cont = if (drop_idx == idx) later_idx else lines.items.len;
+                var j = start_cont;
+                while (j < end_cont) {
                     if (lines.items[j].len > 0 and
                         (lines.items[j][0] == ' ' or lines.items[j][0] == '\t'))
                     {
@@ -1627,6 +1638,18 @@ fn testDecodeStrict(comptime T: type, source: []const u8) !static.Parsed(T) {
     });
 }
 
+fn testDecodeLenient(comptime T: type, source: []const u8) !static.Parsed(T) {
+    return static.parseFromSlice(T, testing.allocator, source, .{
+        .ignore_unknown_fields = true,
+    });
+}
+
+fn testDecodeUseLast(comptime T: type, source: []const u8) !static.Parsed(T) {
+    return static.parseFromSlice(T, testing.allocator, source, .{
+        .duplicate_field_behavior = .use_last,
+    });
+}
+
 fn expectValueString(v: Value, key: []const u8, expected: []const u8) !void {
     const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
@@ -2425,7 +2448,7 @@ test "decode struct with custom yamlParse" {
 test "yamlParse hook honors caller options" {
     // The hook forwards `options` into its own innerParse call so the
     // caller's ignore_unknown_fields setting reaches the inner decode.
-    // Lenient (default) drops "extra"; strict reports UnknownField.
+    // Strict (default) errors on "extra"; lenient drops it.
     const Custom = struct {
         v: i64,
         pub fn yamlParse(allocator: Allocator, node: Node, options: ParseOptions) !@This() {
@@ -2434,11 +2457,11 @@ test "yamlParse hook honors caller options" {
             return .{ .v = inner.v };
         }
     };
-    var ok = try testDecode(Custom, "v: 7\nextra: 1");
+    var ok = try testDecodeLenient(Custom, "v: 7\nextra: 1");
     defer ok.deinit();
     try testing.expectEqual(@as(i64, 7), ok.value.v);
 
-    try testing.expectError(error.UnknownField, testDecodeStrict(Custom, "v: 7\nextra: 1"));
+    try testing.expectError(error.UnknownField, testDecode(Custom, "v: 7\nextra: 1"));
 }
 
 test "decode struct hello world" {
@@ -2506,7 +2529,7 @@ test "decode struct with int slice" {
 
 test "decode struct unmatched field" {
     const S = struct { b: i64 = 0 };
-    var r = try testDecode(S, "a: 1");
+    var r = try testDecodeLenient(S, "a: 1");
     defer r.deinit();
     try testing.expectEqual(@as(i64, 0), r.value.b);
 }
@@ -3356,7 +3379,7 @@ test "anchor alias flow mapping" {
 
 test "anchor alias sequence" {
     const S = struct { b: []const i64 };
-    var r = try testDecode(
+    var r = try testDecodeLenient(
         S,
         \\a: &a [1, 2]
         \\b: *a
@@ -3930,7 +3953,7 @@ test "scientific 1.0e+3 as f64" {
 test "merge key with struct" {
     const Item = struct { b: i64, c: []const u8 };
     const T = struct { items: []const Item };
-    var r = try testDecode(
+    var r = try testDecodeLenient(
         T,
         \\a: &a
         \\  b: 1
@@ -4078,8 +4101,8 @@ test "same anchor redefined" {
     try testing.expectEqual(@as(i64, 3), r.value.d);
 }
 
-test "duplicate map key with allow option" {
-    var r = try testDecode(
+test "duplicate map key with use_last option" {
+    var r = try testDecodeUseLast(
         Value,
         \\a: b
         \\a: c
@@ -4088,6 +4111,28 @@ test "duplicate map key with allow option" {
     );
     defer r.deinit();
     try expectValueString(r.value, "a", "c");
+}
+
+test "duplicate map key with use_first option" {
+    var r = try static.parseFromSlice(
+        Value,
+        testing.allocator,
+        \\a: b
+        \\a: c
+        \\
+        ,
+        .{ .duplicate_field_behavior = .use_first },
+    );
+    defer r.deinit();
+    try expectValueString(r.value, "a", "b");
+}
+
+test "duplicate map key default errors" {
+    try testing.expectError(error.DuplicateKey, testDecode(Value,
+        \\a: b
+        \\a: c
+        \\
+    ));
 }
 
 test "struct with string and seq" {
@@ -4194,7 +4239,7 @@ test "anchor in unmapped field" {
         name: []const u8,
         jobs: []const Job,
     };
-    var r = try testDecode(
+    var r = try testDecodeLenient(
         Config,
         \\shared:
         \\  endpoint: &base_url "http://example.com"
