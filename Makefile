@@ -2,7 +2,7 @@ PROJECT = $(shell basename ${PWD})
 DIR_ROOT = $(realpath $(CURDIR))
 DIR_OUT = _output
 
-ZIG_VERSION = 0.15.2
+ZIG_VERSION = 0.16.0
 CTR_IMAGE_BASE = alpine:3.21
 
 UID = $(shell id -u)

@@ -34,13 +34,15 @@ pub const StringifyOptions = struct {
 /// The caller owns the returned memory and must free it with `allocator`.
 /// Appends a trailing newline if the output doesn't already end with one.
 pub fn stringifyAlloc(allocator: Allocator, val: anytype, options: StringifyOptions) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8){};
-    errdefer list.deinit(allocator);
-    const writer = list.writer(allocator);
-    try writeValue(@TypeOf(val), writer, val, 0, options, false);
-    if (list.items.len == 0 or list.items[list.items.len - 1] != '\n') {
-        try writer.writeByte('\n');
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try writeValue(@TypeOf(val), w, val, 0, options, false);
+    const written = aw.written();
+    if (written.len == 0 or written[written.len - 1] != '\n') {
+        try w.writeByte('\n');
     }
+    var list = aw.toArrayList();
     return list.toOwnedSlice(allocator);
 }
 
@@ -964,7 +966,7 @@ test "encode literal multiline opt strip" {
     const S = struct { v: []const u8 };
     const r = try testEncodeOpts(
         S{
-            .v = std.mem.trimRight(u8,
+            .v = std.mem.trimEnd(u8,
                 \\username: hello
                 \\password: hello123
                 \\
@@ -987,7 +989,7 @@ test "encode literal multiline opt with comment" {
     const S = struct { v: []const u8 };
     const r = try testEncodeOpts(
         S{
-            .v = std.mem.trimRight(u8,
+            .v = std.mem.trimEnd(u8,
                 \\# comment
                 \\username: hello
                 \\password: hello123

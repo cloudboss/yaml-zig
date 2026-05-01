@@ -105,7 +105,7 @@ fn preprocessYaml(allocator: Allocator, source: []const u8) ![]const u8 {
     // Fix bare sequence entries (- followed by newline) that confuse the parser.
     // Only insert explicit null when the next non-empty line is at the same or lower
     // indentation, meaning it's NOT a continuation/value of the dash entry.
-    var result = std.ArrayListUnmanaged(u8){};
+    var result = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < source.len) {
         if (source[i] == '-') {
@@ -194,8 +194,8 @@ fn findNextLineIndent(source: []const u8, pos: usize) ?usize {
 fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
     // Simple line-based deduplication for top-level mapping keys.
     // Keeps the LAST occurrence of each key.
-    var lines = std.ArrayListUnmanaged([]const u8){};
-    var keys = std.ArrayListUnmanaged([]const u8){};
+    var lines = std.ArrayListUnmanaged([]const u8).empty;
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
     var start: usize = 0;
     for (source, 0..) |c, idx| {
         if (c == '\n' or idx == source.len - 1) {
@@ -243,7 +243,7 @@ fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
         }
     }
     // Build result.
-    var result = std.ArrayListUnmanaged(u8){};
+    var result = std.ArrayListUnmanaged(u8).empty;
     for (lines.items, 0..) |line, idx| {
         if (keep[idx]) {
             try result.appendSlice(allocator, line);
@@ -572,8 +572,8 @@ fn decodeMappingValueToValue(
     // Handle merge key in mapping_value.
     if (mv.key) |k| {
         if (k.* == .merge_key or isMergeKeyTag(k.*)) {
-            var keys_list = std.ArrayListUnmanaged(Value){};
-            var vals_list = std.ArrayListUnmanaged(Value){};
+            var keys_list = std.ArrayListUnmanaged(Value).empty;
+            var vals_list = std.ArrayListUnmanaged(Value).empty;
             defer keys_list.deinit(allocator);
             defer vals_list.deinit(allocator);
             if (mv.value) |vn| {
@@ -654,15 +654,14 @@ fn parseFloatFromString(comptime T: type, str: []const u8) !T {
 
 fn base64Decode(allocator: Allocator, encoded: []const u8) ![]const u8 {
     // Strip whitespace.
-    var clean = std.ArrayListUnmanaged(u8){};
+    var clean = std.ArrayListUnmanaged(u8).empty;
     defer clean.deinit(allocator);
     for (encoded) |c| {
         if (c == ' ' or c == '\n' or c == '\r' or c == '\t') continue;
         try clean.append(allocator, c);
     }
     const decoder = std.base64.standard.decoderWithIgnore(" \t\n\r");
-    const decoded_len = decoder.calcSizeUpperBound(clean.items.len) catch
-        return error.TypeMismatch;
+    const decoded_len = decoder.calcSizeUpperBound(clean.items.len);
     const result = try allocator.alloc(u8, decoded_len);
     const actual_len = decoder.decode(result, clean.items) catch
         return error.TypeMismatch;
@@ -707,7 +706,7 @@ fn needsMultilineFolding(s: ast.StringNode) bool {
 }
 
 fn foldMultiline(allocator: Allocator, input: []const u8) ![]const u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '\n') {
@@ -740,7 +739,7 @@ fn foldMultiline(allocator: Allocator, input: []const u8) ![]const u8 {
 }
 
 fn processEscapes(allocator: Allocator, input: []const u8) ![]const u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '\\' and i + 1 < input.len) {
@@ -1424,8 +1423,8 @@ fn decodeMappingToValue(
     anchors: *AnchorMap,
 ) DecodeErrorSet!Value {
     // First pass: count total entries including merges.
-    var keys_list = std.ArrayListUnmanaged(Value){};
-    var vals_list = std.ArrayListUnmanaged(Value){};
+    var keys_list = std.ArrayListUnmanaged(Value).empty;
+    var vals_list = std.ArrayListUnmanaged(Value).empty;
     defer keys_list.deinit(allocator);
     defer vals_list.deinit(allocator);
 
