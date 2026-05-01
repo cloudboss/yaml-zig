@@ -70,6 +70,30 @@ pub const parseFromValueLeaky = static.parseFromValueLeaky;
 pub const innerParse = decoder.innerParse;
 pub const innerParseFromValue = decoder.innerParseFromValue;
 
+/// Build a value that formats `value` as YAML when used with `{f}` in
+/// any std.fmt printing function. The returned wrapper carries the
+/// value and the Stringify options to apply.
+///
+/// Example:
+/// ```zig
+/// std.debug.print("{f}\n", .{yaml.fmt(my_struct, .{})});
+/// ```
+pub fn fmt(value: anytype, options: Stringify.Options) Formatter(@TypeOf(value)) {
+    return .{ .value = value, .options = options };
+}
+
+/// The wrapper type returned by `fmt`. Has a `format` method usable with
+/// the `{f}` formatting verb.
+pub fn Formatter(comptime T: type) type {
+    return struct {
+        value: T,
+        options: Stringify.Options,
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try Stringify.value(self.value, self.options, writer);
+        }
+    };
+}
+
 test {
     _ = token;
     _ = ast;
@@ -238,6 +262,14 @@ test "type with all three hooks round-trips" {
     const fv = try parseFromValueLeaky(Pair, testing.allocator, .{ .array = arr }, .{});
     try testing.expectEqual(@as(i64, 3), fv.x);
     try testing.expectEqual(@as(i64, 4), fv.y);
+}
+
+test "fmt formats a value via std.fmt" {
+    var buf: [64]u8 = undefined;
+    const Config = struct { name: []const u8, port: u16 };
+    const cfg = Config{ .name = "myapp", .port = 8080 };
+    const result = try std.fmt.bufPrint(&buf, "{f}", .{fmt(cfg, .{})});
+    try testing.expectEqualStrings("name: myapp\nport: 8080", result);
 }
 
 test "full pipeline parseFromSlice Stringify.valueAlloc" {
