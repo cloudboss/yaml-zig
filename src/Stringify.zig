@@ -240,7 +240,8 @@ fn beforeStructuralOpen(self: *Stringify) Error!void {
 }
 
 fn hasYamlStringify(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlStringify");
+    const ti = @typeInfo(T);
+    return (ti == .@"struct" or ti == .@"union") and @hasDecl(T, "yamlStringify");
 }
 
 fn writeIndent(writer: *std.Io.Writer, depth: u32, indent_size: u8) !void {
@@ -292,11 +293,6 @@ fn writeValue(
         },
         .@"struct" => |s| {
             try writeStruct(s, T, writer, val, depth, options);
-        },
-        .@"union" => {
-            if (T == Value) {
-                try writeValueUnion(writer, val, depth, options);
-            }
         },
         .@"enum" => {
             // Value.null passes through anytype as the enum tag type.
@@ -641,31 +637,6 @@ fn writeFieldValue(
             return;
         }
     }
-    if (ti == .@"union" and T == Value) {
-        switch (val) {
-            .mapping => |m| {
-                if (m.keys.len == 0) {
-                    try writer.writeAll(": {}");
-                } else {
-                    try writer.writeByte(':');
-                    try writer.writeByte('\n');
-                    try writeIndent(writer, depth + 1, options.indent);
-                    try writeValueUnion(writer, val, depth + 1, options);
-                }
-                return;
-            },
-            .sequence => |s| {
-                if (s.len == 0) {
-                    try writer.writeAll(": []");
-                } else {
-                    try writer.writeByte(':');
-                    try writeValueUnion(writer, val, depth, options);
-                }
-                return;
-            },
-            else => {},
-        }
-    }
     try writer.writeAll(": ");
     try writeValue(T, writer, val, depth + 1, options, false);
 }
@@ -800,11 +771,6 @@ fn writeFlowValue(
         },
         .@"struct" => |s| {
             try writeFlowStruct(s, T, writer, val, options);
-        },
-        .@"union" => {
-            if (T == Value) {
-                try writeFlowValueUnion(writer, val, options);
-            }
         },
         .@"enum" => {
             if (T == std.meta.Tag(Value)) {
