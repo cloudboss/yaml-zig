@@ -55,12 +55,7 @@ pub fn decode(
     defer parse_arena.deinit();
     const parse_alloc = parse_arena.allocator();
 
-    const preprocessed = try preprocessYaml(parse_alloc, source);
-    const root = try parseSource(parse_alloc, preprocessed);
-    const node_val: Node = switch (root) {
-        .document => |d| if (d.body) |b| b.* else Node{ .null_value = .{} },
-        else => root,
-    };
+    const node_val = try parseToNode(parse_alloc, source);
 
     // Result arena for decoded output (duped strings, allocated slices).
     // Ownership transfers to the caller via Parsed(T).
@@ -72,10 +67,39 @@ pub fn decode(
     parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer parsed.arena.deinit();
 
-    const ra = parsed.arena.allocator();
     var anchors = AnchorMap.init(parse_alloc);
-    parsed.value = try decodeNodeInternal(T, ra, node_val, options, &anchors);
+    parsed.value = try decodeNodeInternal(T, parsed.arena.allocator(), node_val, options, &anchors);
     return parsed;
+}
+
+/// Decode YAML into `T` using the caller's allocator directly.
+///
+/// Unlike `decode`, no result arena is created. Strings, slices, and
+/// nested allocations live as long as `allocator` does. Callers who supply
+/// an arena get the same effective semantics as `decode` without the
+/// double-arena overhead.
+pub fn decodeLeaky(
+    comptime T: type,
+    allocator: Allocator,
+    source: []const u8,
+    options: ParseOptions,
+) !T {
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+    const parse_alloc = parse_arena.allocator();
+
+    const node_val = try parseToNode(parse_alloc, source);
+    var anchors = AnchorMap.init(parse_alloc);
+    return try decodeNodeInternal(T, allocator, node_val, options, &anchors);
+}
+
+fn parseToNode(scratch: Allocator, source: []const u8) !Node {
+    const preprocessed = try preprocessYaml(scratch, source);
+    const root = try parseSource(scratch, preprocessed);
+    return switch (root) {
+        .document => |d| if (d.body) |b| b.* else Node{ .null_value = .{} },
+        else => root,
+    };
 }
 
 fn scanAndParse(allocator: Allocator, source: []const u8) !Node {
