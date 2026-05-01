@@ -77,6 +77,21 @@ pub fn parseFromSlice(
     return decoder.decode(T, allocator, source, options);
 }
 
+/// Decode a YAML string into a Zig type `T` using the caller's allocator directly.
+///
+/// Unlike `parseFromSlice`, the result is not wrapped in `Parsed(T)`. There is no
+/// internal arena, and the caller is responsible for the lifetime of any allocated
+/// strings or slices. Pair with an `ArenaAllocator` for the same all-or-nothing
+/// cleanup semantics without the double indirection.
+pub fn parseFromSliceLeaky(
+    comptime T: type,
+    allocator: Allocator,
+    source: []const u8,
+    options: ParseOptions,
+) !T {
+    return decoder.decodeLeaky(T, allocator, source, options);
+}
+
 /// Serialize a Zig value to a YAML string.
 ///
 /// The caller owns the returned slice and must free it with `allocator`.
@@ -134,6 +149,30 @@ test "parseAll stream of documents" {
     );
     defer stream.deinit();
     try testing.expectEqual(@as(usize, 3), stream.docs.len);
+}
+
+test "parseFromSliceLeaky into arena" {
+    const Config = struct {
+        name: []const u8,
+        port: u16,
+    };
+    const input =
+        \\name: myapp
+        \\port: 3000
+        \\
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const config = try parseFromSliceLeaky(Config, arena.allocator(), input, .{});
+    try testing.expectEqualStrings("myapp", config.name);
+    try testing.expectEqual(@as(u16, 3000), config.port);
+}
+
+test "parseFromSliceLeaky scalar" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const n = try parseFromSliceLeaky(i64, arena.allocator(), "42", .{});
+    try testing.expectEqual(@as(i64, 42), n);
 }
 
 test "full pipeline parseFromSlice stringifyAlloc" {
