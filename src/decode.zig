@@ -196,7 +196,11 @@ fn deduplicateKeys(allocator: Allocator, source: []const u8) ![]const u8 {
     return result.items;
 }
 
-pub fn decodeNode(
+/// Decode a single AST `Node` into `T` with a fresh anchor map.
+///
+/// Custom `yamlParse` hooks call this to recurse on a sub-node. Memory
+/// for the result lives in `allocator`.
+pub fn innerParse(
     comptime T: type,
     allocator: Allocator,
     node: Node,
@@ -205,6 +209,17 @@ pub fn decodeNode(
     var anchors = AnchorMap.init(allocator);
     defer anchors.deinit();
     return decodeNodeInternal(T, allocator, node, options, &anchors);
+}
+
+/// Decode a `Value` into `T` directly. Custom `yamlParseFromValue` hooks
+/// call this to recurse on a sub-value.
+pub fn innerParseFromValue(
+    comptime T: type,
+    allocator: Allocator,
+    source: Value,
+    options: ParseOptions,
+) !T {
+    return decodeValueInternal(T, allocator, source, options);
 }
 
 pub const AnchorMap = struct {
@@ -2388,7 +2403,7 @@ test "decode struct with custom yamlParse" {
         max_retries: i64,
 
         pub fn yamlParse(allocator: Allocator, node: Node, options: ParseOptions) !@This() {
-            const v = try decodeNode(Value, allocator, node, options);
+            const v = try innerParse(Value, allocator, node, options);
             return .{
                 .api_key = (v.objectGet("apiKey") orelse
                     return error.MissingField).string,
@@ -2408,14 +2423,14 @@ test "decode struct with custom yamlParse" {
 }
 
 test "yamlParse hook honors caller options" {
-    // The hook forwards `options` into its own decodeNode call so the
+    // The hook forwards `options` into its own innerParse call so the
     // caller's ignore_unknown_fields setting reaches the inner decode.
     // Lenient (default) drops "extra"; strict reports UnknownField.
     const Custom = struct {
         v: i64,
         pub fn yamlParse(allocator: Allocator, node: Node, options: ParseOptions) !@This() {
             const Inner = struct { v: i64 };
-            const inner = try decodeNode(Inner, allocator, node, options);
+            const inner = try innerParse(Inner, allocator, node, options);
             return .{ .v = inner.v };
         }
     };
