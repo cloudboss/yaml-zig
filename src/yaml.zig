@@ -67,6 +67,8 @@ pub const parseFromSlice = static.parseFromSlice;
 pub const parseFromSliceLeaky = static.parseFromSliceLeaky;
 pub const parseFromValue = static.parseFromValue;
 pub const parseFromValueLeaky = static.parseFromValueLeaky;
+pub const innerParse = decoder.innerParse;
+pub const innerParseFromValue = decoder.innerParseFromValue;
 
 test {
     _ = token;
@@ -193,7 +195,7 @@ test "type with all three hooks round-trips" {
         ) !@This() {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            const v = try decoder.decodeNode(Value, arena.allocator(), node, options);
+            const v = try innerParse(Value, arena.allocator(), node, options);
             return fromArray(v);
         }
         pub fn yamlParseFromValue(
