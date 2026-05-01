@@ -45,7 +45,7 @@ pub const suite = @import("suite.zig");
 /// Token types and utility functions.
 pub const token = @import("token.zig");
 /// Dynamic YAML value type.
-pub const value = @import("value.zig");
+pub const dynamic = @import("dynamic.zig");
 
 /// A parsed YAML document with an optional AST body node.
 pub const Document = ast.Document;
@@ -53,8 +53,8 @@ pub const Document = ast.Document;
 pub const Node = ast.Node;
 /// A stream of multiple YAML documents parsed from a single input.
 pub const Stream = ast.Stream;
-/// A dynamically-typed YAML value (null, bool, int, float, string, sequence, or mapping).
-pub const Value = value.Value;
+/// A dynamically typed YAML value (null, bool, int, float, string, array, or object).
+pub const Value = dynamic.Value;
 /// Options for `parseFromSlice`. See `ParseOptions` for field details.
 pub const ParseOptions = decoder.ParseOptions;
 /// The result of decoding YAML into a Zig type `T`. Owns all allocated memory
@@ -109,7 +109,7 @@ pub fn stringify(val: anytype, options: StringifyOptions, writer: anytype) !void
 test {
     _ = token;
     _ = ast;
-    _ = value;
+    _ = dynamic;
     _ = err;
     _ = scanner;
     _ = parser;

@@ -4,7 +4,7 @@ const testing = std.testing;
 
 const decoder = @import("decode.zig");
 const Node = @import("ast.zig").Node;
-const Value = @import("value.zig").Value;
+const Value = @import("dynamic.zig").Value;
 const token = @import("token.zig");
 
 /// Options controlling YAML serialization output format.
@@ -514,21 +514,22 @@ fn writeValueUnion(
 ) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
-        .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
+        .bool => |b| try writer.writeAll(if (b) "true" else "false"),
         .integer => |i| try writer.print("{d}", .{i}),
         .float => |f| try writeFloat(f64, writer, f),
         .string => |s| try writeStringValue(writer, s, depth, options),
-        .sequence => |seq| {
-            if (seq.len == 0) {
+        .array => |arr| {
+            const items = arr.items;
+            if (items.len == 0) {
                 try writer.writeAll("[]");
             } else {
-                for (seq, 0..) |item, idx| {
+                for (items, 0..) |item, idx| {
                     if (idx > 0 or depth > 0) {
                         try writer.writeByte('\n');
                         try writeIndent(writer, depth, options.indent);
                     }
                     switch (item) {
-                        .sequence => {
+                        .array => {
                             try writer.writeByte('-');
                             try writeValueUnion(writer, item, depth + 1, options);
                         },
@@ -540,19 +541,19 @@ fn writeValueUnion(
                 }
             }
         },
-        .mapping => |m| {
-            if (m.keys.len == 0) {
+        .object => |obj| {
+            if (obj.count() == 0) {
                 try writer.writeAll("{}");
             } else {
-                for (m.keys, m.values, 0..) |key, v, idx| {
+                for (obj.keys(), obj.values(), 0..) |key, v, idx| {
                     if (idx > 0) {
                         try writer.writeByte('\n');
                         try writeIndent(writer, depth, options.indent);
                     }
                     try writeValueUnion(writer, key, depth, options);
                     switch (v) {
-                        .mapping => |vm| {
-                            if (vm.keys.len == 0) {
+                        .object => |inner| {
+                            if (inner.count() == 0) {
                                 try writer.writeAll(": {}");
                             } else {
                                 try writer.writeByte(':');
@@ -561,20 +562,20 @@ fn writeValueUnion(
                                 try writeValueUnion(writer, v, depth + 1, options);
                             }
                         },
-                        .sequence => |vs| {
-                            if (vs.len == 0) {
+                        .array => |inner| {
+                            if (inner.items.len == 0) {
                                 try writer.writeAll(": []");
                             } else {
                                 try writer.writeByte(':');
-                                for (vs, 0..) |si, si_idx| {
-                                    if (si_idx > 0 or depth > 0) {
+                                for (inner.items, 0..) |item, item_idx| {
+                                    if (item_idx > 0 or depth > 0) {
                                         try writer.writeByte('\n');
                                         try writeIndent(writer, depth, options.indent);
                                     } else {
                                         try writer.writeByte('\n');
                                     }
                                     try writer.writeAll("- ");
-                                    try writeValueUnion(writer, si, depth + 1, options);
+                                    try writeValueUnion(writer, item, depth + 1, options);
                                 }
                             }
                         },
@@ -686,29 +687,30 @@ fn writeFlowStruct(
 fn writeFlowValueUnion(writer: anytype, val: Value, options: StringifyOptions) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
-        .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
+        .bool => |b| try writer.writeAll(if (b) "true" else "false"),
         .integer => |i| try writer.print("{d}", .{i}),
         .float => |f| try writeFloat(f64, writer, f),
         .string => |s| try writeFlowString(writer, s),
-        .sequence => |seq| {
-            if (seq.len == 0) {
+        .array => |arr| {
+            const items = arr.items;
+            if (items.len == 0) {
                 try writer.writeAll("[]");
                 return;
             }
             try writer.writeByte('[');
-            for (seq, 0..) |item, idx| {
+            for (items, 0..) |item, idx| {
                 if (idx > 0) try writer.writeAll(", ");
                 try writeFlowValueUnion(writer, item, options);
             }
             try writer.writeByte(']');
         },
-        .mapping => |m| {
-            if (m.keys.len == 0) {
+        .object => |obj| {
+            if (obj.count() == 0) {
                 try writer.writeAll("{}");
                 return;
             }
             try writer.writeByte('{');
-            for (m.keys, m.values, 0..) |key, v, idx| {
+            for (obj.keys(), obj.values(), 0..) |key, v, idx| {
                 if (idx > 0) try writer.writeAll(", ");
                 try writeFlowValueUnion(writer, key, options);
                 try writer.writeAll(": ");
@@ -729,6 +731,19 @@ fn testEncodeOpts(val: anytype, opts: StringifyOptions) ![]u8 {
 
 fn testEncodeWithOptions(val: anytype, opts: StringifyOptions) ![]u8 {
     return stringifyAlloc(testing.allocator, val, opts);
+}
+
+fn buildArray(allocator: Allocator, items: []const Value) !Value.Array {
+    var arr: Value.Array = .empty;
+    try arr.appendSlice(allocator, items);
+    return arr;
+}
+
+fn buildObject(allocator: Allocator, keys: []const Value, vals: []const Value) !Value.ObjectMap {
+    std.debug.assert(keys.len == vals.len);
+    var obj: Value.ObjectMap = .empty;
+    for (keys, vals) |k, v| try obj.put(allocator, k, v);
+    return obj;
 }
 
 test "encode null pointer" {
@@ -1382,8 +1397,8 @@ test "encode Value null" {
     try testing.expectEqualStrings("null\n", r);
 }
 
-test "encode Value boolean" {
-    const r = try testEncode(Value{ .boolean = true });
+test "encode Value bool" {
+    const r = try testEncode(Value{ .bool = true });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("true\n", r);
 }
@@ -1400,12 +1415,15 @@ test "encode Value string" {
     try testing.expectEqualStrings("hello\n", r);
 }
 
-test "encode Value sequence" {
-    const items = [_]Value{
-        Value{ .string = "A" },
-        Value{ .string = "B" },
-    };
-    const r = try testEncode(Value{ .sequence = &items });
+test "encode Value array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const arr = try buildArray(aa, &.{
+        .{ .string = "A" },
+        .{ .string = "B" },
+    });
+    const r = try testEncode(Value{ .array = arr });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\- A
@@ -1422,16 +1440,16 @@ test "encode Value float" {
     try testing.expectEqualStrings("3.14\n", r);
 }
 
-test "encode Value mapping" {
-    const keys = [_]Value{
-        Value{ .string = "a" },
-        Value{ .string = "b" },
-    };
-    const vals = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const obj = try buildObject(
+        aa,
+        &.{ .{ .string = "a" }, .{ .string = "b" } },
+        &.{ .{ .integer = 1 }, .{ .integer = 2 } },
+    );
+    const r = try testEncode(Value{ .object = obj });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\a: 1
@@ -1442,24 +1460,20 @@ test "encode Value mapping" {
     );
 }
 
-test "encode Value nested mapping" {
-    const inner_keys = [_]Value{
-        Value{ .string = "b" },
-    };
-    const inner_vals = [_]Value{
-        Value{ .string = "c" },
-    };
-    const inner = Value{
-        .mapping = .{
-            .keys = &inner_keys,
-            .values = &inner_vals,
-        },
-    };
-    const keys = [_]Value{
-        Value{ .string = "a" },
-    };
-    const vals = [_]Value{inner};
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value nested object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const inner = Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "b" }},
+        &.{.{ .string = "c" }},
+    ) };
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "a" }},
+        &.{inner},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\a:
@@ -1470,27 +1484,20 @@ test "encode Value nested mapping" {
     );
 }
 
-test "encode Value mapping with two entries" {
-    const keys = [_]Value{
-        Value{ .string = "b" },
-        Value{ .string = "d" },
-    };
-    const vals = [_]Value{
-        Value{ .string = "c" },
-        Value{ .string = "e" },
-    };
-    const outer_keys = [_]Value{
-        Value{ .string = "a" },
-    };
-    const outer_vals = [_]Value{
-        Value{
-            .mapping = .{
-                .keys = &keys,
-                .values = &vals,
-            },
-        },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &outer_keys, .values = &outer_vals } });
+test "encode Value object with two entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const inner = Value{ .object = try buildObject(
+        aa,
+        &.{ .{ .string = "b" }, .{ .string = "d" } },
+        &.{ .{ .string = "c" }, .{ .string = "e" } },
+    ) };
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "a" }},
+        &.{inner},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\a:
@@ -1502,34 +1509,29 @@ test "encode Value mapping with two entries" {
     );
 }
 
-test "encode Value with mixed sequence" {
-    const inner_keys = [_]Value{
-        Value{ .string = "B" },
-    };
-    const inner_seq = [_]Value{
-        Value{ .integer = 2 },
-        Value{ .integer = 3 },
-    };
-    const inner_vals = [_]Value{
-        Value{ .sequence = &inner_seq },
-    };
-    const seq = [_]Value{
-        Value{ .string = "A" },
-        Value{ .integer = 1 },
-        Value{
-            .mapping = .{
-                .keys = &inner_keys,
-                .values = &inner_vals,
-            },
-        },
-    };
-    const outer_keys = [_]Value{
-        Value{ .string = "v" },
-    };
-    const outer_vals = [_]Value{
-        Value{ .sequence = &seq },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &outer_keys, .values = &outer_vals } });
+test "encode Value with mixed array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const inner_seq = Value{ .array = try buildArray(aa, &.{
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+    }) };
+    const inner_obj = Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "B" }},
+        &.{inner_seq},
+    ) };
+    const seq = Value{ .array = try buildArray(aa, &.{
+        .{ .string = "A" },
+        .{ .integer = 1 },
+        inner_obj,
+    }) };
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "v" }},
+        &.{seq},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\v:
@@ -1545,27 +1547,27 @@ test "encode Value with mixed sequence" {
 }
 
 test "encode Value string 3s" {
-    const keys = [_]Value{
-        Value{ .string = "a" },
-    };
-    const vals = [_]Value{
-        Value{ .string = "3s" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "a" }},
+        &.{.{ .string = "3s" }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("a: 3s\n", r);
 }
 
 test "encode Value timestamp-like string" {
-    const keys = [_]Value{
-        Value{ .string = "t2" },
-        Value{ .string = "t4" },
-    };
-    const vals = [_]Value{
-        Value{ .string = "2018-01-09T10:40:47Z" },
-        Value{ .string = "2098-01-09T10:40:47Z" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{ .{ .string = "t2" }, .{ .string = "t4" } },
+        &.{ .{ .string = "2018-01-09T10:40:47Z" }, .{ .string = "2098-01-09T10:40:47Z" } },
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\t2: "2018-01-09T10:40:47Z"
@@ -1980,23 +1982,20 @@ test "encode struct with multiple optionals" {
     );
 }
 
-test "encode Value empty sequence" {
-    const items = [_]Value{};
-    const r = try testEncode(Value{ .sequence = &items });
+test "encode Value empty array" {
+    const r = try testEncode(Value{ .array = .empty });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("[]\n", r);
 }
 
-test "encode Value empty mapping" {
-    const keys = [_]Value{};
-    const vals = [_]Value{};
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value empty object" {
+    const r = try testEncode(Value{ .object = .empty });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("{}\n", r);
 }
 
-test "encode Value boolean false" {
-    const r = try testEncode(Value{ .boolean = false });
+test "encode Value bool false" {
+    const r = try testEncode(Value{ .bool = false });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("false\n", r);
 }
@@ -2043,13 +2042,16 @@ test "encode Value float nan" {
     try testing.expectEqualStrings(".nan\n", r);
 }
 
-test "encode Value sequence of ints" {
-    const items = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-        Value{ .integer = 3 },
-    };
-    const r = try testEncode(Value{ .sequence = &items });
+test "encode Value array of ints" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const arr = try buildArray(aa, &.{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+    });
+    const r = try testEncode(Value{ .array = arr });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\- 1
@@ -2061,14 +2063,17 @@ test "encode Value sequence of ints" {
     );
 }
 
-test "encode Value sequence of mixed types" {
-    const items = [_]Value{
-        Value{ .string = "hello" },
-        Value{ .integer = 42 },
-        Value{ .boolean = true },
-        Value.null,
-    };
-    const r = try testEncode(Value{ .sequence = &items });
+test "encode Value array of mixed types" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const arr = try buildArray(aa, &.{
+        .{ .string = "hello" },
+        .{ .integer = 42 },
+        .{ .bool = true },
+        .null,
+    });
+    const r = try testEncode(Value{ .array = arr });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\- hello
@@ -2081,16 +2086,18 @@ test "encode Value sequence of mixed types" {
     );
 }
 
-test "encode Value nested sequence" {
-    const inner = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-    };
-    const items = [_]Value{
-        Value{ .string = "a" },
-        Value{ .sequence = &inner },
-    };
-    const r = try testEncode(Value{ .sequence = &items });
+test "encode Value nested array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const inner = Value{ .array = try buildArray(aa, &.{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+    }) };
+    const r = try testEncode(Value{ .array = try buildArray(aa, &.{
+        .{ .string = "a" },
+        inner,
+    }) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\- a
@@ -2103,18 +2110,19 @@ test "encode Value nested sequence" {
     );
 }
 
-test "encode Value mapping with sequence value" {
-    const seq = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-    };
-    const keys = [_]Value{
-        Value{ .string = "items" },
-    };
-    const vals = [_]Value{
-        Value{ .sequence = &seq },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object with array value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const seq = Value{ .array = try buildArray(aa, &.{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+    }) };
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "items" }},
+        &.{seq},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\items:
@@ -2126,60 +2134,67 @@ test "encode Value mapping with sequence value" {
     );
 }
 
-test "encode Value mapping with null value" {
-    const keys = [_]Value{
-        Value{ .string = "v" },
-    };
-    const vals = [_]Value{Value.null};
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object with null value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "v" }},
+        &.{.null},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("v: null\n", r);
 }
 
-test "encode Value mapping with empty string" {
-    const keys = [_]Value{
-        Value{ .string = "v" },
-    };
-    const vals = [_]Value{
-        Value{ .string = "" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object with empty string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "v" }},
+        &.{.{ .string = "" }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("v: \"\"\n", r);
 }
 
-test "encode Value int key mapping" {
-    const keys = [_]Value{
-        Value{ .integer = 1 },
-    };
-    const vals = [_]Value{
-        Value{ .string = "v" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value int key object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .integer = 1 }},
+        &.{.{ .string = "v" }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("1: v\n", r);
 }
 
-test "encode Value float key mapping" {
-    const keys = [_]Value{
-        Value{ .float = 1.1 },
-    };
-    const vals = [_]Value{
-        Value{ .string = "v" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value float key object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .float = 1.1 }},
+        &.{.{ .string = "v" }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("1.1: v\n", r);
 }
 
-test "encode Value bool key mapping" {
-    const keys = [_]Value{
-        Value{ .boolean = true },
-    };
-    const vals = [_]Value{
-        Value{ .string = "v" },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value bool key object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .bool = true }},
+        &.{.{ .string = "v" }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("true: v\n", r);
 }
@@ -2590,33 +2605,32 @@ test "encode struct with nested optional null" {
     try testing.expectEqualStrings("inner: null\n", r);
 }
 
-test "encode flow Value mapping" {
-    const keys = [_]Value{
-        Value{ .string = "a" },
-        Value{ .string = "b" },
-    };
-    const vals = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-    };
+test "encode flow Value object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
     const r = try testEncodeOpts(
-        Value{ .mapping = .{
-            .keys = &keys,
-            .values = &vals,
-        } },
+        Value{ .object = try buildObject(
+            aa,
+            &.{ .{ .string = "a" }, .{ .string = "b" } },
+            &.{ .{ .integer = 1 }, .{ .integer = 2 } },
+        ) },
         .{ .flow_style = true },
     );
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("{a: 1, b: 2}\n", r);
 }
 
-test "encode flow Value sequence" {
-    const items = [_]Value{
-        Value{ .integer = 1 },
-        Value{ .integer = 2 },
-        Value{ .integer = 3 },
-    };
-    const r = try testEncodeOpts(Value{ .sequence = &items }, .{ .flow_style = true });
+test "encode flow Value array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const arr = try buildArray(aa, &.{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+    });
+    const r = try testEncodeOpts(Value{ .array = arr }, .{ .flow_style = true });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("[1, 2, 3]\n", r);
 }
@@ -2662,16 +2676,15 @@ test "encode struct with nested empty slice" {
     );
 }
 
-test "encode Value mapping with bool values" {
-    const keys = [_]Value{
-        Value{ .string = "x" },
-        Value{ .string = "y" },
-    };
-    const vals = [_]Value{
-        Value{ .boolean = true },
-        Value{ .boolean = false },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object with bool values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{ .{ .string = "x" }, .{ .string = "y" } },
+        &.{ .{ .bool = true }, .{ .bool = false } },
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings(
         \\x: true
@@ -2682,14 +2695,15 @@ test "encode Value mapping with bool values" {
     );
 }
 
-test "encode Value mapping with float value" {
-    const keys = [_]Value{
-        Value{ .string = "a" },
-    };
-    const vals = [_]Value{
-        Value{ .float = 100.5 },
-    };
-    const r = try testEncode(Value{ .mapping = .{ .keys = &keys, .values = &vals } });
+test "encode Value object with float value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const r = try testEncode(Value{ .object = try buildObject(
+        aa,
+        &.{.{ .string = "a" }},
+        &.{.{ .float = 100.5 }},
+    ) });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("a: 100.5\n", r);
 }

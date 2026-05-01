@@ -7,7 +7,7 @@ const Node = ast.Node;
 const parser = @import("parser.zig");
 const scanner = @import("scanner.zig");
 const token = @import("token.zig");
-const Value = @import("value.zig").Value;
+const Value = @import("dynamic.zig").Value;
 
 /// Options controlling how YAML is decoded into Zig types.
 pub const ParseOptions = struct {
@@ -413,7 +413,7 @@ fn decodeNodeInternal(
                 return decodeTaggedBool(tag_inner.*);
             }
             if (T == Value) {
-                return Value{ .boolean = try decodeTaggedBool(tag_inner.*) };
+                return Value{ .bool = try decodeTaggedBool(tag_inner.*) };
             }
         }
 
@@ -596,31 +596,24 @@ fn decodeMappingValueToValue(
     // Handle merge key in mapping_value.
     if (mv.key) |k| {
         if (k.* == .merge_key or isMergeKeyTag(k.*)) {
-            var keys_list = std.ArrayListUnmanaged(Value).empty;
-            var vals_list = std.ArrayListUnmanaged(Value).empty;
-            defer keys_list.deinit(allocator);
-            defer vals_list.deinit(allocator);
+            var obj: Value.ObjectMap = .empty;
             if (mv.value) |vn| {
-                try applyMergeToValueMap(allocator, &keys_list, &vals_list, vn, options, anchors);
+                try applyMergeToValueMap(allocator, &obj, vn, options, anchors);
             }
-            const keys = try allocator.alloc(Value, keys_list.items.len);
-            const vals = try allocator.alloc(Value, vals_list.items.len);
-            @memcpy(keys, keys_list.items);
-            @memcpy(vals, vals_list.items);
-            return Value{ .mapping = .{ .keys = keys, .values = vals } };
+            return Value{ .object = obj };
         }
     }
-    const keys = try allocator.alloc(Value, 1);
-    const vals = try allocator.alloc(Value, 1);
-    keys[0] = if (mv.key) |k|
+    var obj: Value.ObjectMap = .empty;
+    const key_val = if (mv.key) |k|
         try decodeToValue(allocator, k.*, options, anchors)
     else
-        .null;
-    vals[0] = if (mv.value) |v|
+        Value.null;
+    const val_val = if (mv.value) |v|
         try decodeToValue(allocator, v.*, options, anchors)
     else
-        .null;
-    return Value{ .mapping = .{ .keys = keys, .values = vals } };
+        Value.null;
+    try obj.put(allocator, key_val, val_val);
+    return Value{ .object = obj };
 }
 
 fn hasYamlParse(comptime T: type) bool {
@@ -1370,7 +1363,7 @@ fn decodeToValue(
 ) DecodeErrorSet!Value {
     return switch (node) {
         .null_value => .null,
-        .boolean => |b| Value{ .boolean = b.value },
+        .boolean => |b| Value{ .bool = b.value },
         .integer => |i| Value{ .integer = i.value },
         .float_value => |f| Value{ .float = f.value },
         .infinity => |inf| Value{
@@ -1396,11 +1389,12 @@ fn decodeToValue(
         .literal => |l| Value{ .string = try allocator.dupe(u8, l.value) },
         .mapping => |m| try decodeMappingToValue(allocator, m, options, anchors),
         .sequence => |s| blk: {
-            const items = try allocator.alloc(Value, s.values.len);
-            for (s.values, 0..) |val, i| {
-                items[i] = try decodeToValue(allocator, val.*, options, anchors);
+            var arr: Value.Array = .empty;
+            try arr.ensureTotalCapacity(allocator, s.values.len);
+            for (s.values) |val| {
+                arr.appendAssumeCapacity(try decodeToValue(allocator, val.*, options, anchors));
             }
-            break :blk Value{ .sequence = items };
+            break :blk Value{ .array = arr };
         },
         .anchor => |a| blk: {
             if (a.value) |inner| {
@@ -1446,20 +1440,15 @@ fn decodeMappingToValue(
     options: ParseOptions,
     anchors: *AnchorMap,
 ) DecodeErrorSet!Value {
-    // First pass: count total entries including merges.
-    var keys_list = std.ArrayListUnmanaged(Value).empty;
-    var vals_list = std.ArrayListUnmanaged(Value).empty;
-    defer keys_list.deinit(allocator);
-    defer vals_list.deinit(allocator);
+    var obj: Value.ObjectMap = .empty;
 
     for (mapping.values) |mv| {
         const key_node = mv.key orelse continue;
         const val_node = mv.value;
 
-        // Check for merge key.
         if (key_node.* == .merge_key or isMergeKeyTag(key_node.*)) {
             if (val_node) |vn| {
-                try applyMergeToValueMap(allocator, &keys_list, &vals_list, vn, options, anchors);
+                try applyMergeToValueMap(allocator, &obj, vn, options, anchors);
             }
             continue;
         }
@@ -1470,27 +1459,11 @@ fn decodeMappingToValue(
         else
             Value.null;
 
-        // Check for duplicate keys - replace existing.
-        var found = false;
-        for (keys_list.items, 0..) |existing_key, idx| {
-            if (existing_key.eql(key_val)) {
-                vals_list.items[idx] = val_val;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try keys_list.append(allocator, key_val);
-            try vals_list.append(allocator, val_val);
-        }
+        // Last-wins for duplicate keys (put replaces existing entries by default).
+        try obj.put(allocator, key_val, val_val);
     }
 
-    const keys = try allocator.alloc(Value, keys_list.items.len);
-    const vals = try allocator.alloc(Value, vals_list.items.len);
-    @memcpy(keys, keys_list.items);
-    @memcpy(vals, vals_list.items);
-
-    return Value{ .mapping = .{ .keys = keys, .values = vals } };
+    return Value{ .object = obj };
 }
 
 const DecodeErrorSet = error{
@@ -1505,8 +1478,7 @@ const DecodeErrorSet = error{
 
 fn applyMergeToValueMap(
     allocator: Allocator,
-    keys_list: *std.ArrayListUnmanaged(Value),
-    vals_list: *std.ArrayListUnmanaged(Value),
+    obj: *Value.ObjectMap,
     val_node: *const Node,
     options: ParseOptions,
     anchors: *AnchorMap,
@@ -1537,7 +1509,7 @@ fn applyMergeToValueMap(
     if (resolved == .sequence) {
         // Merge from sequence of aliases.
         for (resolved.sequence.values) |item| {
-            try applyMergeToValueMap(allocator, keys_list, vals_list, item, options, anchors);
+            try applyMergeToValueMap(allocator, obj, item, options, anchors);
         }
         return;
     }
@@ -1551,16 +1523,9 @@ fn applyMergeToValueMap(
             try decodeToValue(allocator, vn.*, options, anchors)
         else
             Value.null;
-        var found = false;
-        for (keys_list.items) |existing| {
-            if (existing.eql(key_val)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try keys_list.append(allocator, key_val);
-            try vals_list.append(allocator, val_val);
+        // Existing keys take precedence over merged ones.
+        if (!obj.contains(key_val)) {
+            try obj.put(allocator, key_val, val_val);
         }
         return;
     }
@@ -1578,17 +1543,8 @@ fn applyMergeToValueMap(
             try decodeToValue(allocator, vn.*, options, anchors)
         else
             Value.null;
-
-        var found = false;
-        for (keys_list.items) |existing| {
-            if (existing.eql(key_val)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try keys_list.append(allocator, key_val);
-            try vals_list.append(allocator, val_val);
+        if (!obj.contains(key_val)) {
+            try obj.put(allocator, key_val, val_val);
         }
     }
 }
@@ -1604,7 +1560,7 @@ fn testDecodeStrict(comptime T: type, source: []const u8) !Parsed(T) {
 }
 
 fn expectValueString(v: Value, key: []const u8, expected: []const u8) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .string => |s| try testing.expectEqualStrings(
             expected,
@@ -1615,7 +1571,7 @@ fn expectValueString(v: Value, key: []const u8, expected: []const u8) !void {
 }
 
 fn expectValueInt(v: Value, key: []const u8, expected: i64) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .integer => |i| try testing.expectEqual(
             expected,
@@ -1626,9 +1582,9 @@ fn expectValueInt(v: Value, key: []const u8, expected: i64) !void {
 }
 
 fn expectValueBool(v: Value, key: []const u8, expected: bool) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
-        .boolean => |b| try testing.expectEqual(
+        .bool => |b| try testing.expectEqual(
             expected,
             b,
         ),
@@ -1637,12 +1593,12 @@ fn expectValueBool(v: Value, key: []const u8, expected: bool) !void {
 }
 
 fn expectValueNull(v: Value, key: []const u8) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     try testing.expectEqual(@as(std.meta.Tag(Value), .null), @as(std.meta.Tag(Value), val));
 }
 
 fn expectValueFloat(v: Value, key: []const u8, expected: f64, tolerance: f64) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .float => |f| try testing.expectApproxEqAbs(
             expected,
@@ -1654,7 +1610,7 @@ fn expectValueFloat(v: Value, key: []const u8, expected: f64, tolerance: f64) !v
 }
 
 fn expectValuePosInf(v: Value, key: []const u8) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .float => |f| try testing.expect(
             std.math.isPositiveInf(f),
@@ -1664,7 +1620,7 @@ fn expectValuePosInf(v: Value, key: []const u8) !void {
 }
 
 fn expectValueNegInf(v: Value, key: []const u8) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .float => |f| try testing.expect(
             std.math.isNegativeInf(f),
@@ -1674,7 +1630,7 @@ fn expectValueNegInf(v: Value, key: []const u8) !void {
 }
 
 fn expectValueNan(v: Value, key: []const u8) !void {
-    const val = v.mappingGet(key) orelse return error.TestExpectedValue;
+    const val = v.objectGet(key) orelse return error.TestExpectedValue;
     switch (val) {
         .float => |f| try testing.expect(
             std.math.isNan(f),
@@ -2381,9 +2337,9 @@ test "decode struct with custom yamlParse" {
         pub fn yamlParse(allocator: Allocator, node: Node) !@This() {
             const v = try decodeNode(Value, allocator, node, .{});
             return .{
-                .api_key = (v.mappingGet("apiKey") orelse
+                .api_key = (v.objectGet("apiKey") orelse
                     return error.MissingField).string,
-                .max_retries = (v.mappingGet("maxRetries") orelse
+                .max_retries = (v.objectGet("maxRetries") orelse
                     return error.MissingField).integer,
             };
         }
@@ -2543,13 +2499,13 @@ test "flow sequence mixed types as strings" {
 test "flow sequence mixed as Value" {
     var r = try testDecode(Value, "v: [A,1,C]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 3), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqual(@as(i64, 1), s[1].integer);
-            try testing.expectEqualStrings("C", s[2].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 3), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqual(@as(i64, 1), arr.items[1].integer);
+            try testing.expectEqualStrings("C", arr.items[2].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -2558,13 +2514,13 @@ test "flow sequence mixed as Value" {
 test "flow sequence of mappings" {
     var r = try testDecode(Value, "v: [a: b, c: d]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            const m0 = s[0].mappingGet("a") orelse return error.TestExpectedValue;
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            const m0 = arr.items[0].objectGet("a") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("b", m0.string);
-            const m1 = s[1].mappingGet("c") orelse return error.TestExpectedValue;
+            const m1 = arr.items[1].objectGet("c") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("d", m1.string);
         },
         else => return error.TestExpectedEqual,
@@ -2574,15 +2530,15 @@ test "flow sequence of mappings" {
 test "flow sequence of flow mappings" {
     var r = try testDecode(Value, "v: [{a: b}, {c: d, e: f}]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            const m0 = s[0].mappingGet("a") orelse return error.TestExpectedValue;
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            const m0 = arr.items[0].objectGet("a") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("b", m0.string);
-            const m1 = s[1].mappingGet("c") orelse return error.TestExpectedValue;
+            const m1 = arr.items[1].objectGet("c") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("d", m1.string);
-            const m2 = s[1].mappingGet("e") orelse return error.TestExpectedValue;
+            const m2 = arr.items[1].objectGet("e") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("f", m2.string);
         },
         else => return error.TestExpectedEqual,
@@ -2598,12 +2554,12 @@ test "block sequence as Value" {
         ,
     );
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqualStrings("B", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqualStrings("B", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -2649,13 +2605,13 @@ test "block sequence mixed as Value" {
         ,
     );
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 3), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqual(@as(i64, 1), s[1].integer);
-            try testing.expectEqualStrings("C", s[2].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 3), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqual(@as(i64, 1), arr.items[1].integer);
+            try testing.expectEqualStrings("C", arr.items[2].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -2664,8 +2620,8 @@ test "block sequence mixed as Value" {
 test "nested flow mapping as Value" {
     var r = try testDecode(Value, "a: {b: c}");
     defer r.deinit();
-    const inner = r.value.mappingGet("a") orelse return error.TestExpectedValue;
-    const val = inner.mappingGet("b") orelse return error.TestExpectedValue;
+    const inner = r.value.objectGet("a") orelse return error.TestExpectedValue;
+    const val = inner.objectGet("b") orelse return error.TestExpectedValue;
     try testing.expectEqualStrings("c", val.string);
 }
 
@@ -3271,9 +3227,9 @@ test "decode merge key" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueInt(a, "foo", 1);
-    const b = r.value.mappingGet("b") orelse return error.TestExpectedValue;
+    const b = r.value.objectGet("b") orelse return error.TestExpectedValue;
     try expectValueInt(b, "bar", 2);
     try expectValueInt(b, "foo", 1);
 }
@@ -3336,7 +3292,7 @@ test "anchor self reference is null" {
         ,
     );
     defer r.deinit();
-    const key1 = r.value.mappingGet("key1") orelse return error.TestExpectedValue;
+    const key1 = r.value.objectGet("key1") orelse return error.TestExpectedValue;
     try expectValueNull(key1, "subkey");
 }
 
@@ -3344,7 +3300,7 @@ test "anchor as key" {
     var r = try testDecode(Value, "{a: &a c, *a : b}");
     defer r.deinit();
     try expectValueString(r.value, "a", "c");
-    const val = r.value.mappingGet("c") orelse return error.TestExpectedValue;
+    const val = r.value.objectGet("c") orelse return error.TestExpectedValue;
     try testing.expectEqualStrings("b", val.string);
 }
 
@@ -3369,8 +3325,8 @@ test "struct with tags and sequence" {
 test "decode empty struct" {
     var r = try testDecode(Value, "{}");
     defer r.deinit();
-    try testing.expectEqual(@as(std.meta.Tag(Value), .mapping), @as(std.meta.Tag(Value), r.value));
-    try testing.expectEqual(@as(usize, 0), r.value.mapping.keys.len);
+    try testing.expectEqual(@as(std.meta.Tag(Value), .object), @as(std.meta.Tag(Value), r.value));
+    try testing.expectEqual(@as(usize, 0), r.value.object.count());
 }
 
 test "flow mapping with null value" {
@@ -3404,16 +3360,16 @@ test "v: user's item" {
 test "nested flow sequences" {
     var r = try testDecode(Value, "v: [1,[2,[3,[4,5],6],7],8]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 3), s.len);
-            try testing.expectEqual(@as(i64, 1), s[0].integer);
-            try testing.expectEqual(@as(i64, 8), s[2].integer);
-            const inner = s[1].sequence;
-            try testing.expectEqual(@as(usize, 3), inner.len);
-            try testing.expectEqual(@as(i64, 2), inner[0].integer);
-            try testing.expectEqual(@as(i64, 7), inner[2].integer);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 3), arr.items.len);
+            try testing.expectEqual(@as(i64, 1), arr.items[0].integer);
+            try testing.expectEqual(@as(i64, 8), arr.items[2].integer);
+            const inner = arr.items[1].array;
+            try testing.expectEqual(@as(usize, 3), inner.items.len);
+            try testing.expectEqual(@as(i64, 2), inner.items[0].integer);
+            try testing.expectEqual(@as(i64, 7), inner.items[2].integer);
         },
         else => return error.TestExpectedEqual,
     }
@@ -3422,13 +3378,13 @@ test "nested flow sequences" {
 test "nested flow mappings" {
     var r = try testDecode(Value, "v: {a: {b: {c: {d: e},f: g},h: i},j: k}");
     defer r.deinit();
-    const v = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const v = r.value.objectGet("v") orelse return error.TestExpectedValue;
     try expectValueString(v, "j", "k");
-    const a = v.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = v.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueString(a, "h", "i");
-    const b = a.mappingGet("b") orelse return error.TestExpectedValue;
+    const b = a.objectGet("b") orelse return error.TestExpectedValue;
     try expectValueString(b, "f", "g");
-    const c = b.mappingGet("c") orelse return error.TestExpectedValue;
+    const c = b.objectGet("c") orelse return error.TestExpectedValue;
     try expectValueString(c, "d", "e");
 }
 
@@ -3444,11 +3400,11 @@ test "sequence of mappings with null" {
     );
     defer r.deinit();
     switch (r.value) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            const m0 = s[0].mappingGet("a") orelse return error.TestExpectedValue;
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            const m0 = arr.items[0].objectGet("a") orelse return error.TestExpectedValue;
             try expectValueNull(m0, "b");
-            const m1 = s[1].mappingGet("c") orelse return error.TestExpectedValue;
+            const m1 = arr.items[1].objectGet("c") orelse return error.TestExpectedValue;
             try testing.expectEqualStrings("d", m1.string);
         },
         else => return error.TestExpectedEqual,
@@ -3466,7 +3422,7 @@ test "mapping with nested null" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueNull(a, "b");
     try expectValueString(r.value, "c", "d");
 }
@@ -3538,7 +3494,7 @@ test "a: nested map as string" {
         \\
     );
     defer r.deinit();
-    const inner = r.value.a.mappingGet("b") orelse return error.TestExpectedValue;
+    const inner = r.value.a.objectGet("b") orelse return error.TestExpectedValue;
     try testing.expectEqual(@as(std.meta.Tag(Value), .string), @as(std.meta.Tag(Value), inner));
     try testing.expectEqualStrings("c", inner.string);
 }
@@ -3546,14 +3502,14 @@ test "a: nested map as string" {
 test "a: flow map of int" {
     var r = try testDecode(Value, "a: {x: 1}\n");
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueInt(a, "x", 1);
 }
 
 test "a: flow map of strings" {
     var r = try testDecode(Value, "a: {b: c, d: e}\n");
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueString(a, "b", "c");
     try expectValueString(a, "d", "e");
 }
@@ -3659,12 +3615,12 @@ test "document end marker" {
 test "a: int slice from flow" {
     var r = try testDecode(Value, "a: [1, 2]\n");
     defer r.deinit();
-    const seq = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("a") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqual(@as(i64, 1), s[0].integer);
-            try testing.expectEqual(@as(i64, 2), s[1].integer);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqual(@as(i64, 1), arr.items[0].integer);
+            try testing.expectEqual(@as(i64, 2), arr.items[1].integer);
         },
         else => return error.TestExpectedEqual,
     }
@@ -3687,7 +3643,7 @@ test "multi-key map ordering" {
     try expectValueInt(r.value, "a", 1);
     try expectValueInt(r.value, "d", 4);
     try expectValueInt(r.value, "c", 3);
-    const sub = r.value.mappingGet("sub") orelse return error.TestExpectedValue;
+    const sub = r.value.objectGet("sub") orelse return error.TestExpectedValue;
     try expectValueInt(sub, "e", 5);
 }
 
@@ -3921,17 +3877,17 @@ test "merge key as Value" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueInt(a, "b", 1);
     try expectValueString(a, "c", "hello");
-    const items = r.value.mappingGet("items") orelse return error.TestExpectedValue;
+    const items = r.value.objectGet("items") orelse return error.TestExpectedValue;
     switch (items) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try expectValueInt(s[0], "b", 1);
-            try expectValueString(s[0], "c", "hello");
-            try expectValueInt(s[1], "b", 1);
-            try expectValueString(s[1], "c", "world");
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try expectValueInt(arr.items[0], "b", 1);
+            try expectValueString(arr.items[0], "c", "hello");
+            try expectValueInt(arr.items[1], "b", 1);
+            try expectValueString(arr.items[1], "c", "world");
         },
         else => return error.TestExpectedEqual,
     }
@@ -3950,11 +3906,11 @@ test "merge key from sequence of aliases" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueInt(a, "foo", 1);
-    const b = r.value.mappingGet("b") orelse return error.TestExpectedValue;
+    const b = r.value.objectGet("b") orelse return error.TestExpectedValue;
     try expectValueInt(b, "bar", 2);
-    const merge = r.value.mappingGet("merge") orelse return error.TestExpectedValue;
+    const merge = r.value.objectGet("merge") orelse return error.TestExpectedValue;
     try expectValueInt(merge, "foo", 1);
     try expectValueInt(merge, "bar", 2);
 }
@@ -3977,12 +3933,12 @@ test "merge tag with flow mapping" {
 test "flow sequence A B as Value" {
     var r = try testDecode(Value, "v: [A,B]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqualStrings("B", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqualStrings("B", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -4001,12 +3957,12 @@ test "mixed nested list" {
         ,
     );
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 3), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqual(@as(i64, 1), s[1].integer);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 3), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqual(@as(i64, 1), arr.items[1].integer);
         },
         else => return error.TestExpectedEqual,
     }
@@ -4073,23 +4029,23 @@ test "empty sequence item" {
         ,
     );
     defer r.deinit();
-    const args = r.value.mappingGet("args") orelse return error.TestExpectedValue;
+    const args = r.value.objectGet("args") orelse return error.TestExpectedValue;
     switch (args) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("a", s[0].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("a", arr.items[0].string);
             try testing.expectEqual(
                 @as(std.meta.Tag(Value), .null),
-                @as(std.meta.Tag(Value), s[1]),
+                @as(std.meta.Tag(Value), arr.items[1]),
             );
         },
         else => return error.TestExpectedEqual,
     }
-    const cmd = r.value.mappingGet("command") orelse return error.TestExpectedValue;
+    const cmd = r.value.objectGet("command") orelse return error.TestExpectedValue;
     switch (cmd) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 1), s.len);
-            try testing.expectEqualStrings("python", s[0].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 1), arr.items.len);
+            try testing.expectEqualStrings("python", arr.items[0].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -4106,16 +4062,16 @@ test "indented empty sequence item" {
         ,
     );
     defer r.deinit();
-    const parent = r.value.mappingGet("parent") orelse return error.TestExpectedValue;
+    const parent = r.value.objectGet("parent") orelse return error.TestExpectedValue;
     try expectValueString(parent, "other", "val");
-    const items = parent.mappingGet("items") orelse return error.TestExpectedValue;
+    const items = parent.objectGet("items") orelse return error.TestExpectedValue;
     switch (items) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("a", s[0].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("a", arr.items[0].string);
             try testing.expectEqual(
                 @as(std.meta.Tag(Value), .null),
-                @as(std.meta.Tag(Value), s[1]),
+                @as(std.meta.Tag(Value), arr.items[1]),
             );
         },
         else => return error.TestExpectedEqual,
@@ -4132,12 +4088,12 @@ test "empty seq item with next line value" {
         ,
     );
     defer r.deinit();
-    const items = r.value.mappingGet("items") orelse return error.TestExpectedValue;
+    const items = r.value.objectGet("items") orelse return error.TestExpectedValue;
     switch (items) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try expectValueString(s[0], "key", "val");
-            try testing.expectEqualStrings("b", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try expectValueString(arr.items[0], "key", "val");
+            try testing.expectEqualStrings("b", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -4178,7 +4134,7 @@ test "sibling anchor alias simple" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueString(a, "b", "value");
     try expectValueString(a, "ref", "value");
 }
@@ -4196,7 +4152,7 @@ test "sibling anchor alias multiple" {
         ,
     );
     defer r.deinit();
-    const config = r.value.mappingGet("config") orelse return error.TestExpectedValue;
+    const config = r.value.objectGet("config") orelse return error.TestExpectedValue;
     try expectValueString(
         config,
         "db",
@@ -4207,7 +4163,7 @@ test "sibling anchor alias multiple" {
         "cache",
         "redis://localhost:6379",
     );
-    const app = config.mappingGet("app") orelse return error.TestExpectedValue;
+    const app = config.objectGet("app") orelse return error.TestExpectedValue;
     try expectValueString(
         app,
         "database_url",
@@ -4233,12 +4189,12 @@ test "nested map sibling alias" {
         ,
     );
     defer r.deinit();
-    const svc = r.value.mappingGet("service") orelse return error.TestExpectedValue;
-    const auth = svc.mappingGet("auth") orelse return error.TestExpectedValue;
+    const svc = r.value.objectGet("service") orelse return error.TestExpectedValue;
+    const auth = svc.objectGet("auth") orelse return error.TestExpectedValue;
     try expectValueBool(auth, "required", true);
     try expectValueString(auth, "type", "jwt");
-    const ep = svc.mappingGet("endpoint") orelse return error.TestExpectedValue;
-    const sec = ep.mappingGet("security") orelse return error.TestExpectedValue;
+    const ep = svc.objectGet("endpoint") orelse return error.TestExpectedValue;
+    const sec = ep.objectGet("security") orelse return error.TestExpectedValue;
     try expectValueBool(sec, "required", true);
     try expectValueString(sec, "type", "jwt");
 }
@@ -4252,7 +4208,7 @@ test "self recursion anchor is null" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueNull(a, "self");
 }
 
@@ -4304,23 +4260,23 @@ test "anchor with any value and alias" {
         ,
     );
     defer r.deinit();
-    const def = r.value.mappingGet("def") orelse return error.TestExpectedValue;
-    const myenv = def.mappingGet("myenv") orelse return error.TestExpectedValue;
+    const def = r.value.objectGet("def") orelse return error.TestExpectedValue;
+    const myenv = def.objectGet("myenv") orelse return error.TestExpectedValue;
     switch (myenv) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("VAR1=1", s[0].string);
-            try testing.expectEqualStrings("VAR2=2", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("VAR1=1", arr.items[0].string);
+            try testing.expectEqualStrings("VAR2=2", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
-    const config = r.value.mappingGet("config") orelse return error.TestExpectedValue;
-    const env = config.mappingGet("env") orelse return error.TestExpectedValue;
+    const config = r.value.objectGet("config") orelse return error.TestExpectedValue;
+    const env = config.objectGet("env") orelse return error.TestExpectedValue;
     switch (env) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("VAR1=1", s[0].string);
-            try testing.expectEqualStrings("VAR2=2", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("VAR1=1", arr.items[0].string);
+            try testing.expectEqualStrings("VAR2=2", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
@@ -4362,29 +4318,29 @@ test "tab after value" {
     var r = try testDecode(Value, "- a: [2 , 2] \t\t\t\n  b: [2 , 2] \t\t\t\n  c: [2 , 2]");
     defer r.deinit();
     switch (r.value) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 1), s.len);
-            const a = s[0].mappingGet("a") orelse return error.TestExpectedValue;
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 1), arr.items.len);
+            const a = arr.items[0].objectGet("a") orelse return error.TestExpectedValue;
             switch (a) {
-                .sequence => |as| {
-                    try testing.expectEqual(@as(usize, 2), as.len);
-                    try testing.expectEqual(@as(i64, 2), as[0].integer);
+                .array => |inner| {
+                    try testing.expectEqual(@as(usize, 2), inner.items.len);
+                    try testing.expectEqual(@as(i64, 2), inner.items[0].integer);
                 },
                 else => return error.TestExpectedEqual,
             }
-            const b = s[0].mappingGet("b") orelse return error.TestExpectedValue;
+            const b = arr.items[0].objectGet("b") orelse return error.TestExpectedValue;
             switch (b) {
-                .sequence => |bs| {
-                    try testing.expectEqual(@as(usize, 2), bs.len);
-                    try testing.expectEqual(@as(i64, 2), bs[0].integer);
+                .array => |inner| {
+                    try testing.expectEqual(@as(usize, 2), inner.items.len);
+                    try testing.expectEqual(@as(i64, 2), inner.items[0].integer);
                 },
                 else => return error.TestExpectedEqual,
             }
-            const c = s[0].mappingGet("c") orelse return error.TestExpectedValue;
+            const c = arr.items[0].objectGet("c") orelse return error.TestExpectedValue;
             switch (c) {
-                .sequence => |cs| {
-                    try testing.expectEqual(@as(usize, 2), cs.len);
-                    try testing.expectEqual(@as(i64, 2), cs[0].integer);
+                .array => |inner| {
+                    try testing.expectEqual(@as(usize, 2), inner.items.len);
+                    try testing.expectEqual(@as(i64, 2), inner.items[0].integer);
                 },
                 else => return error.TestExpectedEqual,
             }
@@ -4410,10 +4366,10 @@ test "preserve struct defaults" {
 test "decode integer as string key" {
     var r = try testDecode(Value, "42: 100");
     defer r.deinit();
-    try testing.expectEqual(@as(std.meta.Tag(Value), .mapping), @as(std.meta.Tag(Value), r.value));
-    try testing.expectEqual(@as(usize, 1), r.value.mapping.keys.len);
-    try testing.expectEqual(@as(i64, 42), r.value.mapping.keys[0].integer);
-    try testing.expectEqual(@as(i64, 100), r.value.mapping.values[0].integer);
+    try testing.expectEqual(@as(std.meta.Tag(Value), .object), @as(std.meta.Tag(Value), r.value));
+    try testing.expectEqual(@as(usize, 1), r.value.object.count());
+    try testing.expectEqual(@as(i64, 42), r.value.object.keys()[0].integer);
+    try testing.expectEqual(@as(i64, 100), r.value.object.values()[0].integer);
 }
 
 test "decode struct with two fields" {
@@ -4437,7 +4393,7 @@ test "decode nested null values" {
         ,
     );
     defer r.deinit();
-    const a = r.value.mappingGet("a") orelse return error.TestExpectedValue;
+    const a = r.value.objectGet("a") orelse return error.TestExpectedValue;
     try expectValueNull(a, "b");
     try expectValueString(r.value, "c", "d");
 }
@@ -4536,12 +4492,12 @@ test "decode bare tilde" {
 test "flow map A B as Value" {
     var r = try testDecode(Value, "v: [A,B]");
     defer r.deinit();
-    const seq = r.value.mappingGet("v") orelse return error.TestExpectedValue;
+    const seq = r.value.objectGet("v") orelse return error.TestExpectedValue;
     switch (seq) {
-        .sequence => |s| {
-            try testing.expectEqual(@as(usize, 2), s.len);
-            try testing.expectEqualStrings("A", s[0].string);
-            try testing.expectEqualStrings("B", s[1].string);
+        .array => |arr| {
+            try testing.expectEqual(@as(usize, 2), arr.items.len);
+            try testing.expectEqualStrings("A", arr.items[0].string);
+            try testing.expectEqualStrings("B", arr.items[1].string);
         },
         else => return error.TestExpectedEqual,
     }
