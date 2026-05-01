@@ -9,124 +9,10 @@ const scanner = @import("scanner.zig");
 const token = @import("token.zig");
 const Value = @import("dynamic.zig").Value;
 
-/// Options controlling how YAML is decoded into Zig types.
-pub const ParseOptions = struct {
-    /// When true, YAML keys that don't match any struct field are silently
-    /// skipped. When false, an `UnknownField` error is returned. Default: true.
-    ignore_unknown_fields: bool = true,
-    /// Maximum nesting depth for YAML structures. Exceeding this limit returns
-    /// a `MaxDepthExceeded` error. Default: 10,000.
-    max_depth: u32 = 10_000,
-};
+const static = @import("static.zig");
+pub const ParseOptions = static.ParseOptions;
 
-/// Result of decoding YAML into a Zig type `T`.
-///
-/// Owns all allocated memory (strings, slices) via an internal arena.
-/// Call `deinit()` to release everything when done.
-pub fn Parsed(comptime T: type) type {
-    return struct {
-        arena: *std.heap.ArenaAllocator,
-        /// The decoded value.
-        value: T,
-
-        /// Free all memory owned by this parsed result.
-        pub fn deinit(self: @This()) void {
-            const child_allocator = self.arena.child_allocator;
-            self.arena.deinit();
-            child_allocator.destroy(self.arena);
-        }
-    };
-}
-
-/// Decode a YAML string into a Zig type `T`.
-///
-/// Parses `source` as YAML and maps it onto `T`, which may be a struct,
-/// optional, slice, integer, float, bool, string (`[]const u8`), or `Value`.
-/// Returns a `Parsed(T)` that owns all allocated memory.
-pub fn decode(
-    comptime T: type,
-    allocator: Allocator,
-    source: []const u8,
-    options: ParseOptions,
-) !Parsed(T) {
-    // Temporary arena for scanner tokens, AST nodes, and preprocessed source.
-    // Freed before returning — nothing in the result references this.
-    var parse_arena = std.heap.ArenaAllocator.init(allocator);
-    defer parse_arena.deinit();
-    const parse_alloc = parse_arena.allocator();
-
-    const node_val = try parseToNode(parse_alloc, source);
-
-    // Result arena for decoded output (duped strings, allocated slices).
-    // Ownership transfers to the caller via Parsed(T).
-    var parsed = Parsed(T){
-        .arena = try allocator.create(std.heap.ArenaAllocator),
-        .value = undefined,
-    };
-    errdefer allocator.destroy(parsed.arena);
-    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer parsed.arena.deinit();
-
-    var anchors = AnchorMap.init(parse_alloc);
-    parsed.value = try decodeNodeInternal(T, parsed.arena.allocator(), node_val, options, &anchors);
-    return parsed;
-}
-
-/// Decode YAML into `T` using the caller's allocator directly.
-///
-/// Unlike `decode`, no result arena is created. Strings, slices, and
-/// nested allocations live as long as `allocator` does. Callers who supply
-/// an arena get the same effective semantics as `decode` without the
-/// double-arena overhead.
-pub fn decodeLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    source: []const u8,
-    options: ParseOptions,
-) !T {
-    var parse_arena = std.heap.ArenaAllocator.init(allocator);
-    defer parse_arena.deinit();
-    const parse_alloc = parse_arena.allocator();
-
-    const node_val = try parseToNode(parse_alloc, source);
-    var anchors = AnchorMap.init(parse_alloc);
-    return try decodeNodeInternal(T, allocator, node_val, options, &anchors);
-}
-
-/// Decode an existing `Value` tree into a Zig type `T`.
-///
-/// Returns a `Parsed(T)` whose arena owns any memory allocated for the
-/// result (duped strings, allocated slices, nested arrays/objects). The
-/// source `Value` is left untouched.
-pub fn decodeFromValue(
-    comptime T: type,
-    allocator: Allocator,
-    value: Value,
-    options: ParseOptions,
-) !Parsed(T) {
-    var parsed = Parsed(T){
-        .arena = try allocator.create(std.heap.ArenaAllocator),
-        .value = undefined,
-    };
-    errdefer allocator.destroy(parsed.arena);
-    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer parsed.arena.deinit();
-
-    parsed.value = try decodeValueInternal(T, parsed.arena.allocator(), value, options);
-    return parsed;
-}
-
-/// Decode an existing `Value` tree into `T` using the caller's allocator.
-pub fn decodeFromValueLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    value: Value,
-    options: ParseOptions,
-) !T {
-    return decodeValueInternal(T, allocator, value, options);
-}
-
-fn parseToNode(scratch: Allocator, source: []const u8) !Node {
+pub fn parseToNode(scratch: Allocator, source: []const u8) !Node {
     const preprocessed = try preprocessYaml(scratch, source);
     const root = try parseSource(scratch, preprocessed);
     return switch (root) {
@@ -321,18 +207,18 @@ pub fn decodeNode(
     return decodeNodeInternal(T, allocator, node, options, &anchors);
 }
 
-const AnchorMap = struct {
+pub const AnchorMap = struct {
     map: std.StringHashMap(*const Node),
     active: std.StringHashMap(void),
 
-    fn init(allocator: Allocator) AnchorMap {
+    pub fn init(allocator: Allocator) AnchorMap {
         return .{
             .map = std.StringHashMap(*const Node).init(allocator),
             .active = std.StringHashMap(void).init(allocator),
         };
     }
 
-    fn deinit(self: *AnchorMap) void {
+    pub fn deinit(self: *AnchorMap) void {
         self.map.deinit();
         self.active.deinit();
     }
@@ -371,7 +257,7 @@ fn isStringType(comptime T: type) bool {
     return T == []const u8 or T == []u8;
 }
 
-fn decodeValueInternal(
+pub fn decodeValueInternal(
     comptime T: type,
     allocator: Allocator,
     value: Value,
@@ -505,7 +391,7 @@ fn cloneValue(allocator: Allocator, value: Value) std.mem.Allocator.Error!Value 
     };
 }
 
-fn decodeNodeInternal(
+pub fn decodeNodeInternal(
     comptime T: type,
     allocator: Allocator,
     node: Node,
@@ -1716,12 +1602,12 @@ fn applyMergeToValueMap(
     }
 }
 
-fn testDecode(comptime T: type, source: []const u8) !Parsed(T) {
-    return decode(T, testing.allocator, source, .{});
+fn testDecode(comptime T: type, source: []const u8) !static.Parsed(T) {
+    return static.parseFromSlice(T, testing.allocator, source, .{});
 }
 
-fn testDecodeStrict(comptime T: type, source: []const u8) !Parsed(T) {
-    return decode(T, testing.allocator, source, .{
+fn testDecodeStrict(comptime T: type, source: []const u8) !static.Parsed(T) {
+    return static.parseFromSlice(T, testing.allocator, source, .{
         .ignore_unknown_fields = false,
     });
 }
@@ -3887,7 +3773,7 @@ test "decode overflow returns error" {
 
 test "decode unknown field strict mode" {
     const Config = struct { name: []const u8 };
-    const result = decode(
+    const result = static.parseFromSlice(
         Config,
         testing.allocator,
         "name: app\nunknown: field",
@@ -4587,7 +4473,7 @@ test "decode nested null values" {
 test "disallow unknown nested" {
     const Inner = struct { b: i64 };
     const S = struct { c: Inner };
-    const result = decode(
+    const result = static.parseFromSlice(
         S,
         testing.allocator,
         \\---

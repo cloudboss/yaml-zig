@@ -5,7 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-const decoder = @import("decode.zig");
+const static = @import("static.zig");
 const Value = @import("dynamic.zig").Value;
 const token = @import("token.zig");
 
@@ -2928,7 +2928,7 @@ test "encode flow bool values" {
 test "encode round-trip integer" {
     const encoded = try testEncode(@as(i64, 42));
     defer testing.allocator.free(encoded);
-    const decoded = try decoder.decode(i64, testing.allocator, encoded, .{});
+    const decoded = try static.parseFromSlice(i64, testing.allocator, encoded, .{});
     defer decoded.deinit();
     try testing.expectEqual(@as(i64, 42), decoded.value);
 }
@@ -2936,7 +2936,7 @@ test "encode round-trip integer" {
 test "encode round-trip string" {
     const encoded = try testEncode(@as([]const u8, "hello"));
     defer testing.allocator.free(encoded);
-    const decoded = try decoder.decode([]const u8, testing.allocator, encoded, .{});
+    const decoded = try static.parseFromSlice([]const u8, testing.allocator, encoded, .{});
     defer decoded.deinit();
     try testing.expectEqualStrings("hello", decoded.value);
 }
@@ -2944,7 +2944,7 @@ test "encode round-trip string" {
 test "encode round-trip bool" {
     const encoded = try testEncode(true);
     defer testing.allocator.free(encoded);
-    const decoded = try decoder.decode(bool, testing.allocator, encoded, .{});
+    const decoded = try static.parseFromSlice(bool, testing.allocator, encoded, .{});
     defer decoded.deinit();
     try testing.expect(decoded.value);
 }

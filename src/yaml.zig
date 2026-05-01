@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const decoder = @import("decode.zig");
+const static = @import("static.zig");
 
 /// Abstract syntax tree types for YAML documents.
 pub const ast = @import("ast.zig");
@@ -57,63 +58,15 @@ pub const Stream = ast.Stream;
 /// A dynamically typed YAML value (null, bool, int, float, string, array, or object).
 pub const Value = dynamic.Value;
 /// Options for `parseFromSlice`. See `ParseOptions` for field details.
-pub const ParseOptions = decoder.ParseOptions;
+pub const ParseOptions = static.ParseOptions;
 /// The result of decoding YAML into a Zig type `T`. Owns all allocated memory
 /// via an internal arena. Call `deinit()` to free.
-pub const Parsed = decoder.Parsed;
+pub const Parsed = static.Parsed;
 
-/// Decode a YAML string into a Zig type `T`.
-///
-/// Returns a `Parsed(T)` that owns all allocated memory. Call `deinit()` when done.
-/// Supports structs, optionals, slices, integers, floats, booleans, strings, and
-/// `Value` for dynamic access. See `ParseOptions` for configuration.
-pub fn parseFromSlice(
-    comptime T: type,
-    allocator: Allocator,
-    source: []const u8,
-    options: ParseOptions,
-) !Parsed(T) {
-    return decoder.decode(T, allocator, source, options);
-}
-
-/// Decode a YAML string into a Zig type `T` using the caller's allocator directly.
-///
-/// Unlike `parseFromSlice`, the result is not wrapped in `Parsed(T)`. There is no
-/// internal arena, and the caller is responsible for the lifetime of any allocated
-/// strings or slices. Pair with an `ArenaAllocator` for the same all-or-nothing
-/// cleanup semantics without the double indirection.
-pub fn parseFromSliceLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    source: []const u8,
-    options: ParseOptions,
-) !T {
-    return decoder.decodeLeaky(T, allocator, source, options);
-}
-
-/// Decode an existing `Value` tree into a Zig type `T`.
-///
-/// Useful when YAML has already been parsed dynamically and a typed view
-/// is needed afterwards. Returns a `Parsed(T)` whose arena owns any
-/// memory allocated while building the result.
-pub fn parseFromValue(
-    comptime T: type,
-    allocator: Allocator,
-    source: Value,
-    options: ParseOptions,
-) !Parsed(T) {
-    return decoder.decodeFromValue(T, allocator, source, options);
-}
-
-/// Decode an existing `Value` tree into `T` using the caller's allocator.
-pub fn parseFromValueLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    source: Value,
-    options: ParseOptions,
-) !T {
-    return decoder.decodeFromValueLeaky(T, allocator, source, options);
-}
+pub const parseFromSlice = static.parseFromSlice;
+pub const parseFromSliceLeaky = static.parseFromSliceLeaky;
+pub const parseFromValue = static.parseFromValue;
+pub const parseFromValueLeaky = static.parseFromValueLeaky;
 
 test {
     _ = token;
@@ -124,6 +77,7 @@ test {
     _ = parser;
     _ = emitter;
     _ = decoder;
+    _ = static;
     _ = Stringify;
     _ = suite;
 }
