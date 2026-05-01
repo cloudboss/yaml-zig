@@ -55,8 +55,10 @@ pub const ScanError = error{
     TabInIndent,
 };
 
-/// Errors produced during AST parsing.
-pub const ParseError = error{
+/// Errors produced during AST parsing (the low-level `parser.parse` and
+/// `parser.parseAll` entry points). For the umbrella error returned by the
+/// typed parse paths, use `ParseError`.
+pub const AstParseError = error{
     SyntaxError,
     UnexpectedToken,
     DuplicateKey,
@@ -78,8 +80,8 @@ pub const EncodeError = error{
     InvalidValue,
 };
 
-/// Concrete errors returned by `parseFromValue` / `parseFromValueLeaky`,
-/// or by any decoding path that walks an existing `Value` tree.
+/// Concrete errors returned by `parseFromValue` and `parseFromValueLeaky`.
+/// Matches the role of std.json's ParseFromValueError.
 pub const ParseFromValueError = error{
     UnexpectedToken,
     InvalidNumber,
@@ -87,12 +89,18 @@ pub const ParseFromValueError = error{
     DuplicateField,
     LengthMismatch,
 } ||
-    ParseError ||
+    AstParseError ||
     DecodeError ||
     ScanError ||
     std.mem.Allocator.Error ||
     std.fmt.ParseIntError ||
     std.fmt.ParseFloatError;
+
+/// Umbrella error returned by `parseFromSlice` and `parseFromSliceLeaky`.
+/// Without a streaming source variant the set collapses to
+/// ParseFromValueError, so this is an alias rather than a generic over a
+/// Source type.
+pub const ParseError = ParseFromValueError;
 
 test "error detail has position for invalid yaml" {
     try testing.expectError(error.SyntaxError, parser.parse(testing.allocator, ":\n  :\n    :"));
