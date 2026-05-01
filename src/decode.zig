@@ -289,8 +289,6 @@ pub fn decodeValueInternal(
     value: Value,
     options: ParseOptions,
 ) !T {
-    if (T == Value) return cloneValue(allocator, value);
-
     if (comptime hasYamlParseFromValue(T)) {
         return T.yamlParseFromValue(allocator, value, options);
     }
@@ -389,7 +387,8 @@ pub fn decodeValueInternal(
 }
 
 fn hasYamlParseFromValue(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlParseFromValue");
+    const ti = @typeInfo(T);
+    return (ti == .@"struct" or ti == .@"union") and @hasDecl(T, "yamlParseFromValue");
 }
 
 pub fn cloneValue(allocator: Allocator, value: Value) std.mem.Allocator.Error!Value {
@@ -434,6 +433,9 @@ pub fn decodeNodeInternal(
 
     // Handle mapping_value nodes (single key-value pair from parser).
     if (node == .mapping_value) {
+        if (comptime hasYamlParse(T)) {
+            return T.yamlParse(allocator, node, options);
+        }
         return decodeMappingValueAsMapping(T, allocator, node.mapping_value, options, anchors);
     }
 
@@ -473,26 +475,17 @@ pub fn decodeNodeInternal(
                 const encoded = getNodeStringValue(tag_inner.*);
                 return base64Decode(allocator, encoded);
             }
-            if (T == Value) {
-                const encoded = getNodeStringValue(tag_inner.*);
-                const decoded = try base64Decode(allocator, encoded);
-                return Value{ .string = decoded };
-            }
         }
 
         if (std.mem.eql(u8, tag_str, "!!null")) {
             const ti = @typeInfo(T);
             if (ti == .optional) return null;
-            if (T == Value) return .null;
-            return decodeNull(T, allocator);
+            if (comptime !hasYamlParse(T)) return decodeNull(T, allocator);
         }
 
         if (std.mem.eql(u8, tag_str, "!!bool")) {
             if (@typeInfo(T) == .bool or T == bool) {
                 return decodeTaggedBool(tag_inner.*);
-            }
-            if (T == Value) {
-                return Value{ .bool = try decodeTaggedBool(tag_inner.*) };
             }
         }
 
@@ -500,22 +493,21 @@ pub fn decodeNodeInternal(
             if (@typeInfo(T) == .float) {
                 return decodeTaggedFloat(T, tag_inner.*);
             }
-            if (T == Value) {
-                const f = try decodeTaggedFloat(f64, tag_inner.*);
-                return Value{ .float = f };
-            }
         }
 
         if (std.mem.eql(u8, tag_str, "!!str")) {
             if (comptime isStringType(T)) {
                 return allocator.dupe(u8, getNodeStringValue(tag_inner.*));
             }
-            if (T == Value) {
-                return Value{ .string = try allocator.dupe(u8, getNodeStringValue(tag_inner.*)) };
-            }
         }
 
-        // For !!map, !!merge, and unknown tags, decode the inner value.
+        // Types with a yamlParse hook want the whole tag node so they
+        // can decide what to do with the tag.
+        if (comptime hasYamlParse(T)) {
+            return T.yamlParse(allocator, node, options);
+        }
+
+        // Otherwise unwrap the tag and decode the inner node.
         return decodeNodeInternal(T, allocator, tag_inner.*, options, anchors);
     }
 
@@ -531,11 +523,6 @@ pub fn decodeNodeInternal(
         if (node == .null_value) return null;
         const Child = info.optional.child;
         return @as(T, try decodeNodeInternal(Child, allocator, node, options, anchors));
-    }
-
-    // Handle Value union (untyped decode).
-    if (T == Value) {
-        return decodeToValue(allocator, node, options, anchors);
     }
 
     // Handle string types.
@@ -652,11 +639,6 @@ fn decodeMappingValueAsMapping(
         return result;
     }
 
-    // For Value, create a mapping with one entry.
-    if (T == Value) {
-        return decodeMappingValueToValue(allocator, mv, options, anchors);
-    }
-
     // For optional.
     if (info == .optional) {
         const Child = info.optional.child;
@@ -696,7 +678,8 @@ fn decodeMappingValueToValue(
 }
 
 fn hasYamlParse(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlParse");
+    const ti = @typeInfo(T);
+    return (ti == .@"struct" or ti == .@"union") and @hasDecl(T, "yamlParse");
 }
 
 fn decodeTaggedBool(node: Node) !bool {
@@ -1503,10 +1486,25 @@ pub fn decodeToValue(
         },
         .mapping_value => |mv| try decodeMappingValueToValue(allocator, mv, options, anchors),
         .tag => |t| blk: {
-            if (t.value) |inner| {
-                break :blk try decodeToValue(allocator, inner.*, options, anchors);
+            const inner = t.value orelse break :blk .null;
+            if (std.mem.eql(u8, t.tag, "!!binary")) {
+                const decoded = try base64Decode(allocator, getNodeStringValue(inner.*));
+                break :blk Value{ .string = decoded };
             }
-            break :blk .null;
+            if (std.mem.eql(u8, t.tag, "!!null")) {
+                break :blk .null;
+            }
+            if (std.mem.eql(u8, t.tag, "!!bool")) {
+                break :blk Value{ .bool = try decodeTaggedBool(inner.*) };
+            }
+            if (std.mem.eql(u8, t.tag, "!!float")) {
+                break :blk Value{ .float = try decodeTaggedFloat(f64, inner.*) };
+            }
+            if (std.mem.eql(u8, t.tag, "!!str")) {
+                break :blk Value{ .string = try allocator.dupe(u8, getNodeStringValue(inner.*)) };
+            }
+            // Unknown or pass-through tag: decode the inner node.
+            break :blk try decodeToValue(allocator, inner.*, options, anchors);
         },
         .merge_key => .null,
         else => .null,
