@@ -21,7 +21,7 @@ pub const max_nesting_depth = 64;
 pub const Options = struct {
     /// Number of spaces per indentation level. Default: 2.
     indent: u8 = 2,
-    /// When true, emit all mappings and sequences in flow (inline JSON-like) style
+    /// When true, emit all objects and arrays in flow (inline) style
     /// rather than block style. Default: false.
     flow_style: bool = false,
     /// When true, emit multi-line strings as YAML literal block scalars (`|`)
@@ -34,8 +34,8 @@ pub const Options = struct {
     /// When true, omit struct fields whose values are empty (empty strings, null
     /// optionals, zero integers, false booleans, empty slices). Default: false.
     omit_empty: bool = false,
-    /// When true, indent sequence items one level deeper within their parent
-    /// mapping. Default: false.
+    /// When true, indent array items one level deeper within their
+    /// parent object. Default: false.
     indent_sequence: bool = false,
 };
 

@@ -9,7 +9,7 @@ const ParseOptions = @import("static.zig").ParseOptions;
 
 /// A dynamically typed YAML value.
 ///
-/// Represents any YAML scalar, sequence, or mapping without requiring a
+/// Represents any YAML scalar, array, or object without requiring a
 /// compile-time Zig type. Useful for working with YAML of unknown structure.
 /// Can be used as the target type for `parseFromSlice`.
 pub const Value = union(enum) {
@@ -26,9 +26,10 @@ pub const Value = union(enum) {
 
     /// Order-preserving map keyed by `Value`.
     ///
-    /// YAML 1.2 permits any node as a mapping key (integers, floats, booleans,
-    /// sequences, sub-mappings); `Value` keys preserve that capability while
-    /// keeping the std.json-style `put`/`get`/`iterator` interface.
+    /// YAML 1.2 permits any node as an object key. Integers, floats,
+    /// booleans, arrays, and nested objects all work. Keying the map on
+    /// `Value` preserves that capability while still providing a regular
+    /// `put`, `get`, and `iterator` interface.
     pub const ObjectMap = std.array_hash_map.Custom(
         Value,
         Value,
