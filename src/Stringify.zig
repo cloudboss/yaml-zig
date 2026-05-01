@@ -6,7 +6,6 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const decoder = @import("decode.zig");
-const Node = @import("ast.zig").Node;
 const Value = @import("dynamic.zig").Value;
 const token = @import("token.zig");
 
@@ -240,6 +239,10 @@ fn beforeStructuralOpen(self: *Stringify) Error!void {
     }
 }
 
+fn hasYamlStringify(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlStringify");
+}
+
 fn writeIndent(writer: *std.Io.Writer, depth: u32, indent_size: u8) !void {
     var i: u32 = 0;
     while (i < depth * indent_size) : (i += 1) {
@@ -255,6 +258,11 @@ fn writeValue(
     options: Options,
     flow: bool,
 ) !void {
+    if (comptime hasYamlStringify(T)) {
+        var s: Stringify = .init(writer, options);
+        s.indent_level = depth;
+        return val.yamlStringify(&s);
+    }
     const ti = @typeInfo(T);
     if (flow or options.flow_style) {
         return writeFlowValue(T, writer, val, options);
@@ -1769,16 +1777,19 @@ test "encode single quote backslash yaml" {
 test "encode struct with yamlStringify" {
     const Custom = struct {
         x: i64,
-        pub fn yamlStringify(
-            _: @This(),
-            _: Allocator,
-        ) !Node {
-            return error.Unimplemented;
+        y: i64,
+        pub fn yamlStringify(self: @This(), s: *Stringify) !void {
+            try s.beginObject();
+            try s.objectField("x");
+            try s.write(self.x);
+            try s.objectField("y");
+            try s.write(self.y);
+            try s.endObject();
         }
     };
-    const r = try testEncode(Custom{ .x = 1 });
+    const r = try testEncode(Custom{ .x = 1, .y = 2 });
     defer testing.allocator.free(r);
-    try testing.expect(r.len > 0);
+    try testing.expectEqualStrings("x: 1\ny: 2\n", r);
 }
 
 test "encode flow style struct" {
