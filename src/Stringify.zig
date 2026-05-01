@@ -10,6 +10,14 @@ const Node = @import("ast.zig").Node;
 const Value = @import("dynamic.zig").Value;
 const token = @import("token.zig");
 
+const Stringify = @This();
+
+pub const Error = std.Io.Writer.Error;
+
+/// Maximum nesting depth tracked by the streaming API. Beyond this, the
+/// container stack assertion will trip in safety builds.
+pub const max_nesting_depth = 64;
+
 /// Options controlling YAML serialization output format.
 pub const Options = struct {
     /// Number of spaces per indentation level. Default: 2.
@@ -32,8 +40,35 @@ pub const Options = struct {
     indent_sequence: bool = false,
 };
 
+writer: *std.Io.Writer,
+options: Options = .{},
+indent_level: u32 = 0,
+state: State = .doc_start,
+container_stack: [max_nesting_depth]Container = undefined,
+container_top: u32 = 0,
+
+const Container = enum { object, array };
+
+const State = enum {
+    /// Nothing emitted yet at this level.
+    doc_start,
+    /// Just opened a container; no entries written yet.
+    container_start,
+    /// Just emitted an object field with its colon. The value follows next.
+    after_field,
+    /// Between entries of an object (last action wrote a value).
+    in_object,
+    /// Between entries of an array (last action wrote an item).
+    in_array,
+};
+
+/// Construct a new streaming Stringify over `writer`.
+pub fn init(writer: *std.Io.Writer, options: Options) Stringify {
+    return .{ .writer = writer, .options = options };
+}
+
 /// Serialize a Zig value as YAML, writing directly to `writer`.
-pub fn value(val: anytype, options: Options, writer: anytype) !void {
+pub fn value(val: anytype, options: Options, writer: *std.Io.Writer) !void {
     try writeValue(@TypeOf(val), writer, val, 0, options, false);
 }
 
@@ -52,6 +87,133 @@ pub fn valueAlloc(allocator: Allocator, val: anytype, options: Options) ![]u8 {
     }
     var list = aw.toArrayList();
     return list.toOwnedSlice(allocator);
+}
+
+fn writeIndentLevel(self: *Stringify) !void {
+    var i: u32 = 0;
+    while (i < self.indent_level * self.options.indent) : (i += 1) {
+        try self.writer.writeByte(' ');
+    }
+}
+
+fn pushContainer(self: *Stringify, kind: Container) void {
+    std.debug.assert(self.container_top < self.container_stack.len);
+    self.container_stack[self.container_top] = kind;
+    self.container_top += 1;
+}
+
+fn popContainer(self: *Stringify, expected: Container) void {
+    std.debug.assert(self.container_top > 0);
+    self.container_top -= 1;
+    std.debug.assert(self.container_stack[self.container_top] == expected);
+}
+
+fn currentContainer(self: *const Stringify) ?Container {
+    if (self.container_top == 0) return null;
+    return self.container_stack[self.container_top - 1];
+}
+
+/// Open a YAML mapping (object) at the current cursor position.
+pub fn beginObject(self: *Stringify) Error!void {
+    try self.beforeStructuralOpen();
+    self.pushContainer(.object);
+    self.state = .container_start;
+}
+
+/// Close the current object.
+pub fn endObject(self: *Stringify) Error!void {
+    self.popContainer(.object);
+    if (self.indent_level > 0) self.indent_level -= 1;
+    self.state = .in_object;
+}
+
+/// Emit `name:` as the next object field. Must be called inside an object.
+pub fn objectField(self: *Stringify, key: []const u8) Error!void {
+    std.debug.assert(self.currentContainer() == .object);
+    switch (self.state) {
+        .container_start => {},
+        .in_object => try self.writer.writeByte('\n'),
+        .doc_start, .after_field, .in_array => unreachable,
+    }
+    try self.writeIndentLevel();
+    try self.writer.writeAll(key);
+    try self.writer.writeByte(':');
+    self.state = .after_field;
+}
+
+/// Open a YAML sequence (array) at the current cursor position.
+pub fn beginArray(self: *Stringify) Error!void {
+    try self.beforeStructuralOpen();
+    self.pushContainer(.array);
+    self.state = .container_start;
+}
+
+/// Close the current array.
+pub fn endArray(self: *Stringify) Error!void {
+    self.popContainer(.array);
+    if (self.indent_level > 0) self.indent_level -= 1;
+    self.state = .in_array;
+}
+
+/// Write a value at the current cursor position. Dispatches by `@TypeOf(v)`:
+/// scalars are formatted directly, structs/slices/Value go through the same
+/// path as `value()`. After this call, the cursor is positioned right after
+/// the emitted value (no trailing newline).
+pub fn write(self: *Stringify, v: anytype) Error!void {
+    switch (self.state) {
+        .doc_start => {
+            try writeValue(@TypeOf(v), self.writer, v, self.indent_level, self.options, false);
+        },
+        .after_field => {
+            try self.writer.writeByte(' ');
+            try writeValue(@TypeOf(v), self.writer, v, self.indent_level, self.options, false);
+            self.state = .in_object;
+        },
+        .container_start => switch (self.currentContainer().?) {
+            .object => unreachable,
+            .array => {
+                try self.writeIndentLevel();
+                try self.writer.writeAll("- ");
+                try writeValue(@TypeOf(v), self.writer, v, self.indent_level + 1, self.options, false);
+                self.state = .in_array;
+            },
+        },
+        .in_array => {
+            try self.writer.writeByte('\n');
+            try self.writeIndentLevel();
+            try self.writer.writeAll("- ");
+            try writeValue(@TypeOf(v), self.writer, v, self.indent_level + 1, self.options, false);
+        },
+        .in_object => unreachable,
+    }
+}
+
+/// Position the cursor before opening a nested container inside the current
+/// context, emitting any structural punctuation required (newline + indent
+/// for an object-field value, "- " prefix for an array item).
+fn beforeStructuralOpen(self: *Stringify) Error!void {
+    switch (self.state) {
+        .doc_start => {},
+        .after_field => {
+            try self.writer.writeByte('\n');
+            self.indent_level += 1;
+        },
+        .container_start => {
+            // Inside a fresh array: "- " then nested container content begins
+            // on the same line, which YAML allows.
+            std.debug.assert(self.currentContainer() == .array);
+            try self.writeIndentLevel();
+            try self.writer.writeAll("- ");
+            self.indent_level += 1;
+        },
+        .in_array => {
+            try self.writer.writeByte('\n');
+            try self.writeIndentLevel();
+            try self.writer.writeAll("- ");
+            self.indent_level += 1;
+        },
+        .in_object => unreachable,
+    }
 }
 
 fn writeIndent(writer: anytype, depth: u32, indent_size: u8) !void {
@@ -332,16 +494,6 @@ fn writeSlice(
     options: Options,
 ) !void {
     writeSliceInner(Child, writer, val, depth, options, true) catch |err| return err;
-}
-
-fn writeSliceTop(
-    comptime Child: type,
-    writer: anytype,
-    val: []const Child,
-    depth: u32,
-    options: Options,
-) !void {
-    writeSliceInner(Child, writer, val, depth, options, false) catch |err| return err;
 }
 
 fn writeSliceInner(
@@ -722,10 +874,6 @@ fn testEncode(val: anytype) ![]u8 {
 }
 
 fn testEncodeOpts(val: anytype, opts: Options) ![]u8 {
-    return valueAlloc(testing.allocator, val, opts);
-}
-
-fn testEncodeWithOptions(val: anytype, opts: Options) ![]u8 {
     return valueAlloc(testing.allocator, val, opts);
 }
 
@@ -2817,35 +2965,35 @@ test "encode multi-byte unicode string" {
 
 test "encode struct omit empty string" {
     const S = struct { a: []const u8, b: []const u8 };
-    const output = try testEncodeWithOptions(S{ .a = "hello", .b = "" }, .{ .omit_empty = true });
+    const output = try testEncodeOpts(S{ .a = "hello", .b = "" }, .{ .omit_empty = true });
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("a: hello\n", output);
 }
 
 test "encode struct omit null optional" {
     const S = struct { a: []const u8, b: ?[]const u8 };
-    const output = try testEncodeWithOptions(S{ .a = "hello", .b = null }, .{ .omit_empty = true });
+    const output = try testEncodeOpts(S{ .a = "hello", .b = null }, .{ .omit_empty = true });
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("a: hello\n", output);
 }
 
 test "encode struct omit zero int" {
     const S = struct { a: i64, b: i64 };
-    const output = try testEncodeWithOptions(S{ .a = 42, .b = 0 }, .{ .omit_empty = true });
+    const output = try testEncodeOpts(S{ .a = 42, .b = 0 }, .{ .omit_empty = true });
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("a: 42\n", output);
 }
 
 test "encode struct omit false bool" {
     const S = struct { a: bool, b: bool };
-    const output = try testEncodeWithOptions(S{ .a = true, .b = false }, .{ .omit_empty = true });
+    const output = try testEncodeOpts(S{ .a = true, .b = false }, .{ .omit_empty = true });
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("a: true\n", output);
 }
 
 test "encode struct omit empty slice" {
     const S = struct { a: i64, b: []const []const u8 };
-    const output = try testEncodeWithOptions(S{ .a = 1, .b = &.{} }, .{ .omit_empty = true });
+    const output = try testEncodeOpts(S{ .a = 1, .b = &.{} }, .{ .omit_empty = true });
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("a: 1\n", output);
 }
@@ -2869,4 +3017,57 @@ test "encode indent sequence false" {
     const r = try testEncodeOpts(S{ .v = &.{ "A", "B" } }, .{ .indent_sequence = false });
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("v:\n- A\n- B\n", r);
+}
+
+test "Stringify object two fields" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var ys: Stringify = .init(&aw.writer, .{});
+    try ys.beginObject();
+    try ys.objectField("name");
+    try ys.write(@as([]const u8, "ada"));
+    try ys.objectField("port");
+    try ys.write(@as(u16, 8080));
+    try ys.endObject();
+    try testing.expectEqualStrings("name: ada\nport: 8080", aw.written());
+}
+
+test "Stringify nested object" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var ys: Stringify = .init(&aw.writer, .{});
+    try ys.beginObject();
+    try ys.objectField("outer");
+    try ys.beginObject();
+    try ys.objectField("inner");
+    try ys.write(@as(i64, 42));
+    try ys.endObject();
+    try ys.endObject();
+    try testing.expectEqualStrings("outer:\n  inner: 42", aw.written());
+}
+
+test "Stringify array of strings" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var ys: Stringify = .init(&aw.writer, .{});
+    try ys.beginArray();
+    try ys.write(@as([]const u8, "a"));
+    try ys.write(@as([]const u8, "b"));
+    try ys.write(@as([]const u8, "c"));
+    try ys.endArray();
+    try testing.expectEqualStrings("- a\n- b\n- c", aw.written());
+}
+
+test "Stringify array as object field value" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var ys: Stringify = .init(&aw.writer, .{});
+    try ys.beginObject();
+    try ys.objectField("items");
+    try ys.beginArray();
+    try ys.write(@as(i64, 1));
+    try ys.write(@as(i64, 2));
+    try ys.endArray();
+    try ys.endObject();
+    try testing.expectEqualStrings("items:\n  - 1\n  - 2", aw.written());
 }
