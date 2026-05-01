@@ -93,6 +93,39 @@ pub fn decodeLeaky(
     return try decodeNodeInternal(T, allocator, node_val, options, &anchors);
 }
 
+/// Decode an existing `Value` tree into a Zig type `T`.
+///
+/// Returns a `Parsed(T)` whose arena owns any memory allocated for the
+/// result (duped strings, allocated slices, nested arrays/objects). The
+/// source `Value` is left untouched.
+pub fn decodeFromValue(
+    comptime T: type,
+    allocator: Allocator,
+    value: Value,
+    options: ParseOptions,
+) !Parsed(T) {
+    var parsed = Parsed(T){
+        .arena = try allocator.create(std.heap.ArenaAllocator),
+        .value = undefined,
+    };
+    errdefer allocator.destroy(parsed.arena);
+    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer parsed.arena.deinit();
+
+    parsed.value = try decodeValueInternal(T, parsed.arena.allocator(), value, options);
+    return parsed;
+}
+
+/// Decode an existing `Value` tree into `T` using the caller's allocator.
+pub fn decodeFromValueLeaky(
+    comptime T: type,
+    allocator: Allocator,
+    value: Value,
+    options: ParseOptions,
+) !T {
+    return decodeValueInternal(T, allocator, value, options);
+}
+
 fn parseToNode(scratch: Allocator, source: []const u8) !Node {
     const preprocessed = try preprocessYaml(scratch, source);
     const root = try parseSource(scratch, preprocessed);
@@ -336,6 +369,140 @@ fn decodeNull(comptime T: type, allocator: Allocator) !T {
 
 fn isStringType(comptime T: type) bool {
     return T == []const u8 or T == []u8;
+}
+
+fn decodeValueInternal(
+    comptime T: type,
+    allocator: Allocator,
+    value: Value,
+    options: ParseOptions,
+) !T {
+    if (T == Value) return cloneValue(allocator, value);
+
+    if (comptime hasYamlParseFromValue(T)) {
+        return T.yamlParseFromValue(allocator, value, options);
+    }
+
+    const info = @typeInfo(T);
+
+    if (info == .optional) {
+        if (value == .null) return null;
+        return @as(T, try decodeValueInternal(info.optional.child, allocator, value, options));
+    }
+
+    return switch (info) {
+        .bool => switch (value) {
+            .bool => |b| b,
+            else => error.TypeMismatch,
+        },
+        .int => switch (value) {
+            .integer => |i| std.math.cast(T, i) orelse error.Overflow,
+            .float => |f| if (@floor(f) == f)
+                std.math.cast(T, @as(i64, @intFromFloat(f))) orelse error.Overflow
+            else
+                error.TypeMismatch,
+            else => error.TypeMismatch,
+        },
+        .float => switch (value) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => error.TypeMismatch,
+        },
+        .pointer => |ptr| blk: {
+            if (ptr.size != .slice) break :blk error.TypeMismatch;
+            if (comptime isStringType(T)) {
+                if (value != .string) break :blk error.TypeMismatch;
+                break :blk try allocator.dupe(u8, value.string);
+            }
+            if (value != .array) break :blk error.TypeMismatch;
+            const items = value.array.items;
+            const out = try allocator.alloc(ptr.child, items.len);
+            for (items, 0..) |item, i| {
+                out[i] = try decodeValueInternal(ptr.child, allocator, item, options);
+            }
+            break :blk out;
+        },
+        .array => |arr| blk: {
+            if (value != .array) break :blk error.TypeMismatch;
+            const items = value.array.items;
+            if (items.len != arr.len) break :blk error.LengthMismatch;
+            var result: T = undefined;
+            for (items, 0..) |item, i| {
+                result[i] = try decodeValueInternal(arr.child, allocator, item, options);
+            }
+            break :blk result;
+        },
+        .@"struct" => blk: {
+            if (value != .object) break :blk error.TypeMismatch;
+            const obj = value.object;
+            var result: T = undefined;
+            inline for (info.@"struct".fields) |field| {
+                if (obj.get(.{ .string = field.name })) |fv| {
+                    @field(result, field.name) = try decodeValueInternal(
+                        field.type,
+                        allocator,
+                        fv,
+                        options,
+                    );
+                } else if (field.default_value_ptr) |dv| {
+                    @field(result, field.name) =
+                        @as(*const field.type, @ptrCast(@alignCast(dv))).*;
+                } else if (@typeInfo(field.type) == .optional) {
+                    @field(result, field.name) = null;
+                } else {
+                    break :blk error.MissingField;
+                }
+            }
+            if (!options.ignore_unknown_fields) {
+                for (obj.keys()) |k| {
+                    if (k != .string) continue;
+                    var found = false;
+                    inline for (info.@"struct".fields) |field| {
+                        if (std.mem.eql(u8, k.string, field.name)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) break :blk error.UnknownField;
+                }
+            }
+            break :blk result;
+        },
+        .@"enum" => switch (value) {
+            .string => |s| std.meta.stringToEnum(T, s) orelse error.InvalidEnumTag,
+            else => error.TypeMismatch,
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+fn hasYamlParseFromValue(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlParseFromValue");
+}
+
+fn cloneValue(allocator: Allocator, value: Value) std.mem.Allocator.Error!Value {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .string => |s| Value{ .string = try allocator.dupe(u8, s) },
+        .array => |arr| blk: {
+            var out: Value.Array = .empty;
+            try out.ensureTotalCapacity(allocator, arr.items.len);
+            for (arr.items) |item| {
+                out.appendAssumeCapacity(try cloneValue(allocator, item));
+            }
+            break :blk Value{ .array = out };
+        },
+        .object => |obj| blk: {
+            var out: Value.ObjectMap = .empty;
+            try out.ensureTotalCapacity(allocator, @intCast(obj.count()));
+            for (obj.keys(), obj.values()) |k, v| {
+                const ck = try cloneValue(allocator, k);
+                const cv = try cloneValue(allocator, v);
+                try out.put(allocator, ck, cv);
+            }
+            break :blk Value{ .object = out };
+        },
+    };
 }
 
 fn decodeNodeInternal(

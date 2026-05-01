@@ -92,6 +92,30 @@ pub fn parseFromSliceLeaky(
     return decoder.decodeLeaky(T, allocator, source, options);
 }
 
+/// Decode an existing `Value` tree into a Zig type `T`.
+///
+/// Useful when YAML has already been parsed dynamically and a typed view
+/// is needed afterwards. Returns a `Parsed(T)` whose arena owns any
+/// memory allocated while building the result.
+pub fn parseFromValue(
+    comptime T: type,
+    allocator: Allocator,
+    source: Value,
+    options: ParseOptions,
+) !Parsed(T) {
+    return decoder.decodeFromValue(T, allocator, source, options);
+}
+
+/// Decode an existing `Value` tree into `T` using the caller's allocator.
+pub fn parseFromValueLeaky(
+    comptime T: type,
+    allocator: Allocator,
+    source: Value,
+    options: ParseOptions,
+) !T {
+    return decoder.decodeFromValueLeaky(T, allocator, source, options);
+}
+
 /// Serialize a Zig value to a YAML string.
 ///
 /// The caller owns the returned slice and must free it with `allocator`.
@@ -173,6 +197,47 @@ test "parseFromSliceLeaky scalar" {
     defer arena.deinit();
     const n = try parseFromSliceLeaky(i64, arena.allocator(), "42", .{});
     try testing.expectEqual(@as(i64, 42), n);
+}
+
+test "parseFromValue into struct" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var obj: Value.ObjectMap = .empty;
+    try obj.put(aa, .{ .string = "name" }, .{ .string = "myapp" });
+    try obj.put(aa, .{ .string = "port" }, .{ .integer = 3000 });
+
+    const Config = struct { name: []const u8, port: u16 };
+    var parsed = try parseFromValue(Config, testing.allocator, .{ .object = obj }, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("myapp", parsed.value.name);
+    try testing.expectEqual(@as(u16, 3000), parsed.value.port);
+}
+
+test "parseFromValueLeaky scalar" {
+    const n = try parseFromValueLeaky(i64, testing.allocator, .{ .integer = 42 }, .{});
+    try testing.expectEqual(@as(i64, 42), n);
+}
+
+test "parseFromValue identity for Value clones" {
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const sa = src_arena.allocator();
+
+    var arr: Value.Array = .empty;
+    try arr.appendSlice(sa, &.{ .{ .integer = 1 }, .{ .integer = 2 } });
+    const source = Value{ .array = arr };
+
+    var parsed = try parseFromValue(Value, testing.allocator, source, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try testing.expectEqual(@as(i64, 1), parsed.value.array.items[0].integer);
+
+    // Source can be torn down independently of the result.
+    src_arena.deinit();
+    try testing.expectEqual(@as(i64, 2), parsed.value.array.items[1].integer);
+    src_arena = std.heap.ArenaAllocator.init(testing.allocator);
 }
 
 test "full pipeline parseFromSlice stringifyAlloc" {
