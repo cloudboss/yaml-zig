@@ -609,7 +609,7 @@ fn decodeNodeInternal(
 
     // Check for yamlParse custom method.
     if (comptime hasYamlParse(T)) {
-        return T.yamlParse(allocator, node);
+        return T.yamlParse(allocator, node, options);
     }
 
     const info = @typeInfo(T);
@@ -678,7 +678,7 @@ fn decodeMappingValueAsMapping(
         if (comptime hasYamlParse(T)) {
             // Wrap in mapping node for yamlParse.
             const node = Node{ .mapping_value = mv };
-            return T.yamlParse(allocator, node);
+            return T.yamlParse(allocator, node, options);
         }
 
         var result: T = undefined;
@@ -2501,8 +2501,8 @@ test "decode struct with custom yamlParse" {
         api_key: []const u8,
         max_retries: i64,
 
-        pub fn yamlParse(allocator: Allocator, node: Node) !@This() {
-            const v = try decodeNode(Value, allocator, node, .{});
+        pub fn yamlParse(allocator: Allocator, node: Node, options: ParseOptions) !@This() {
+            const v = try decodeNode(Value, allocator, node, options);
             return .{
                 .api_key = (v.objectGet("apiKey") orelse
                     return error.MissingField).string,
@@ -2519,6 +2519,25 @@ test "decode struct with custom yamlParse" {
     defer r.deinit();
     try testing.expectEqualStrings("secret123", r.value.api_key);
     try testing.expectEqual(@as(i64, 5), r.value.max_retries);
+}
+
+test "yamlParse hook honors caller options" {
+    // The hook forwards `options` into its own decodeNode call so the
+    // caller's ignore_unknown_fields setting reaches the inner decode.
+    // Lenient (default) drops "extra"; strict reports UnknownField.
+    const Custom = struct {
+        v: i64,
+        pub fn yamlParse(allocator: Allocator, node: Node, options: ParseOptions) !@This() {
+            const Inner = struct { v: i64 };
+            const inner = try decodeNode(Inner, allocator, node, options);
+            return .{ .v = inner.v };
+        }
+    };
+    var ok = try testDecode(Custom, "v: 7\nextra: 1");
+    defer ok.deinit();
+    try testing.expectEqual(@as(i64, 7), ok.value.v);
+
+    try testing.expectError(error.UnknownField, testDecodeStrict(Custom, "v: 7\nextra: 1"));
 }
 
 test "decode struct hello world" {
