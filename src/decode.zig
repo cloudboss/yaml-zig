@@ -392,7 +392,7 @@ fn hasYamlParseFromValue(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "yamlParseFromValue");
 }
 
-fn cloneValue(allocator: Allocator, value: Value) std.mem.Allocator.Error!Value {
+pub fn cloneValue(allocator: Allocator, value: Value) std.mem.Allocator.Error!Value {
     return switch (value) {
         .null, .bool, .integer, .float => value,
         .string => |s| Value{ .string = try allocator.dupe(u8, s) },
@@ -1434,7 +1434,7 @@ fn decodeToArray(
     return result;
 }
 
-fn decodeToValue(
+pub fn decodeToValue(
     allocator: Allocator,
     node: Node,
     options: ParseOptions,
