@@ -216,7 +216,7 @@ fn beforeStructuralOpen(self: *Stringify) Error!void {
     }
 }
 
-fn writeIndent(writer: anytype, depth: u32, indent_size: u8) !void {
+fn writeIndent(writer: *std.Io.Writer, depth: u32, indent_size: u8) !void {
     var i: u32 = 0;
     while (i < depth * indent_size) : (i += 1) {
         try writer.writeByte(' ');
@@ -225,7 +225,7 @@ fn writeIndent(writer: anytype, depth: u32, indent_size: u8) !void {
 
 fn writeValue(
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: T,
     depth: u32,
     options: Options,
@@ -277,7 +277,7 @@ fn writeValue(
     }
 }
 
-fn writeFloat(comptime T: type, writer: anytype, val: T) !void {
+fn writeFloat(comptime T: type, writer: *std.Io.Writer, val: T) !void {
     const f: f64 = @floatCast(val);
     if (std.math.isNan(f)) {
         try writer.writeAll(".nan");
@@ -308,7 +308,7 @@ fn writeFloat(comptime T: type, writer: anytype, val: T) !void {
     }
 }
 
-fn writeScientific(writer: anytype, f: anytype) !void {
+fn writeScientific(writer: *std.Io.Writer, f: anytype) !void {
     var buf: [64]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{e}", .{f}) catch unreachable;
     // Find the 'e' separator.
@@ -346,7 +346,7 @@ fn isString(comptime T: type) bool {
 }
 
 fn writeStringValue(
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: []const u8,
     depth: u32,
     options: Options,
@@ -396,7 +396,7 @@ fn hasNewlines(val: []const u8, line_end: LineEnding) bool {
 }
 
 fn writeBlockScalar(
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: []const u8,
     depth: u32,
     options: Options,
@@ -459,7 +459,7 @@ fn hasControlChars(val: []const u8) bool {
     return false;
 }
 
-fn writeDoubleQuoted(writer: anytype, val: []const u8) !void {
+fn writeDoubleQuoted(writer: *std.Io.Writer, val: []const u8) !void {
     try writer.writeByte('"');
     for (val) |c| {
         switch (c) {
@@ -474,7 +474,7 @@ fn writeDoubleQuoted(writer: anytype, val: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn writeSingleQuoted(writer: anytype, val: []const u8) !void {
+fn writeSingleQuoted(writer: *std.Io.Writer, val: []const u8) !void {
     try writer.writeByte('\'');
     for (val) |c| {
         if (c == '\'') {
@@ -488,7 +488,7 @@ fn writeSingleQuoted(writer: anytype, val: []const u8) !void {
 
 fn writeSlice(
     comptime Child: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: []const Child,
     depth: u32,
     options: Options,
@@ -498,7 +498,7 @@ fn writeSlice(
 
 fn writeSliceInner(
     comptime Child: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: []const Child,
     depth: u32,
     options: Options,
@@ -521,7 +521,7 @@ fn writeSliceInner(
 fn writeStruct(
     comptime s: std.builtin.Type.Struct,
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: T,
     depth: u32,
     options: Options,
@@ -548,7 +548,7 @@ fn writeStruct(
 
 fn writeFieldValue(
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: T,
     depth: u32,
     options: Options,
@@ -655,7 +655,7 @@ fn isEmptyValue(comptime T: type, val: T) bool {
 }
 
 fn writeValueUnion(
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: Value,
     depth: u32,
     options: Options,
@@ -740,7 +740,7 @@ fn writeValueUnion(
 
 fn writeFlowValue(
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: T,
     options: Options,
 ) !void {
@@ -783,7 +783,7 @@ fn writeFlowValue(
     }
 }
 
-fn writeFlowString(writer: anytype, val: []const u8) !void {
+fn writeFlowString(writer: *std.Io.Writer, val: []const u8) !void {
     if (needsDoubleQuoting(val, true)) {
         try writeDoubleQuoted(writer, val);
     } else {
@@ -793,7 +793,7 @@ fn writeFlowString(writer: anytype, val: []const u8) !void {
 
 fn writeFlowSlice(
     comptime Child: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: []const Child,
     options: Options,
 ) !void {
@@ -812,7 +812,7 @@ fn writeFlowSlice(
 fn writeFlowStruct(
     comptime s: std.builtin.Type.Struct,
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     val: T,
     options: Options,
 ) !void {
@@ -832,7 +832,7 @@ fn writeFlowStruct(
     try writer.writeByte('}');
 }
 
-fn writeFlowValueUnion(writer: anytype, val: Value, options: Options) !void {
+fn writeFlowValueUnion(writer: *std.Io.Writer, val: Value, options: Options) !void {
     switch (val) {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
