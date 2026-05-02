@@ -5,8 +5,8 @@ const token_mod = @import("token.zig");
 const Token = token_mod.Token;
 const TokenType = token_mod.TokenType;
 
-const Buf = std.ArrayListUnmanaged(u8);
-const LineBuf = std.ArrayListUnmanaged([]const u8);
+const Buf = std.ArrayList(u8);
+const LineBuf = std.ArrayList([]const u8);
 
 /// YAML tokenizer (lexer).
 ///
@@ -20,7 +20,7 @@ pub const Scanner = struct {
     line: u32,
     column: u32,
     flow_level: u32,
-    tokens: std.ArrayListUnmanaged(Token),
+    tokens: std.ArrayList(Token),
     line_indent: u32 = 0,
     flow_indent: u32 = 0,
     at_line_start: bool = true,

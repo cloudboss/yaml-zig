@@ -49,7 +49,7 @@ fn preprocessYaml(allocator: Allocator, source: []const u8) ![]const u8 {
     // Fix bare sequence entries (- followed by newline) that confuse the parser.
     // Only insert explicit null when the next non-empty line is at the same or lower
     // indentation, meaning it's NOT a continuation/value of the dash entry.
-    var result = std.ArrayListUnmanaged(u8).empty;
+    var result = std.ArrayList(u8).empty;
     var i: usize = 0;
     while (i < source.len) {
         if (source[i] == '-') {
@@ -143,8 +143,8 @@ fn deduplicateKeys(
     keep_which: DuplicateKeep,
 ) ![]const u8 {
     // Line-based deduplication for top-level mapping keys.
-    var lines = std.ArrayListUnmanaged([]const u8).empty;
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var lines = std.ArrayList([]const u8).empty;
+    var keys = std.ArrayList([]const u8).empty;
     var start: usize = 0;
     for (source, 0..) |c, idx| {
         if (c == '\n' or idx == source.len - 1) {
@@ -197,7 +197,7 @@ fn deduplicateKeys(
         }
     }
     // Build result.
-    var result = std.ArrayListUnmanaged(u8).empty;
+    var result = std.ArrayList(u8).empty;
     for (lines.items, 0..) |line, idx| {
         if (keep[idx]) {
             try result.appendSlice(allocator, line);
@@ -733,7 +733,7 @@ fn parseFloatFromString(comptime T: type, str: []const u8) !T {
 
 fn base64Decode(allocator: Allocator, encoded: []const u8) ![]const u8 {
     // Strip whitespace.
-    var clean = std.ArrayListUnmanaged(u8).empty;
+    var clean = std.ArrayList(u8).empty;
     defer clean.deinit(allocator);
     for (encoded) |c| {
         if (c == ' ' or c == '\n' or c == '\r' or c == '\t') continue;
@@ -785,7 +785,7 @@ fn needsMultilineFolding(s: ast.StringNode) bool {
 }
 
 fn foldMultiline(allocator: Allocator, input: []const u8) ![]const u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
+    var buf = std.ArrayList(u8).empty;
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '\n') {
@@ -818,7 +818,7 @@ fn foldMultiline(allocator: Allocator, input: []const u8) ![]const u8 {
 }
 
 fn processEscapes(allocator: Allocator, input: []const u8) ![]const u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
+    var buf = std.ArrayList(u8).empty;
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '\\' and i + 1 < input.len) {
