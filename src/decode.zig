@@ -234,23 +234,21 @@ pub fn innerParseFromValue(
 }
 
 pub const AnchorMap = struct {
-    map: std.StringHashMap(*const Node),
-    active: std.StringHashMap(void),
+    allocator: Allocator,
+    map: std.StringHashMapUnmanaged(*const Node) = .empty,
+    active: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(allocator: Allocator) AnchorMap {
-        return .{
-            .map = std.StringHashMap(*const Node).init(allocator),
-            .active = std.StringHashMap(void).init(allocator),
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *AnchorMap) void {
-        self.map.deinit();
-        self.active.deinit();
+        self.map.deinit(self.allocator);
+        self.active.deinit(self.allocator);
     }
 
     fn put(self: *AnchorMap, name: []const u8, node: *const Node) void {
-        self.map.put(name, node) catch {};
+        self.map.put(self.allocator, name, node) catch {};
     }
 
     fn get(self: *AnchorMap, name: []const u8) ?*const Node {
@@ -262,7 +260,7 @@ pub const AnchorMap = struct {
     }
 
     fn markActive(self: *AnchorMap, name: []const u8) void {
-        self.active.put(name, {}) catch {};
+        self.active.put(self.allocator, name, {}) catch {};
     }
 
     fn unmarkActive(self: *AnchorMap, name: []const u8) void {
