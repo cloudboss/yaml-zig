@@ -16,7 +16,7 @@ pub const EmitOptions = struct {
 };
 
 const Writer = struct {
-    buf: *std.ArrayListUnmanaged(u8),
+    buf: *std.ArrayList(u8),
     allocator: Allocator,
 
     fn writeAll(self: *Writer, data: []const u8) Allocator.Error!void {
@@ -33,7 +33,7 @@ const Writer = struct {
 /// Performs a round-trip-safe serialization: comments, document markers, and
 /// block scalar styles are preserved. The caller owns the returned slice.
 pub fn emit(allocator: Allocator, node: Node, options: EmitOptions) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     var w = Writer{ .buf = &buf, .allocator = allocator };
 
