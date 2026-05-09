@@ -299,6 +299,190 @@ test "parseFromValue identity for Value clones" {
     src_arena = std.heap.ArenaAllocator.init(testing.allocator);
 }
 
+test "parseFromSlice optional Value field, nested mapping" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  section: true
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables != null);
+    try testing.expect(parsed.value.variables.? == .object);
+    const obj = parsed.value.variables.?.object;
+    const got = obj.get(.{ .string = "section" });
+    try testing.expect(got != null);
+    try testing.expectEqual(true, got.?.bool);
+}
+
+test "parseFromSlice required Value field, nested mapping" {
+    const T = struct { variables: Value };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  count: 3
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables == .object);
+    const got = parsed.value.variables.object.get(.{ .string = "count" });
+    try testing.expect(got != null);
+    try testing.expectEqual(@as(i64, 3), got.?.integer);
+}
+
+test "parseFromSlice optional Value field, scalar" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator, "variables: 42\n", .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables != null);
+    try testing.expectEqual(@as(i64, 42), parsed.value.variables.?.integer);
+}
+
+test "parseFromSlice optional Value field, string scalar" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator, "variables: hello\n", .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables != null);
+    try testing.expectEqualStrings("hello", parsed.value.variables.?.string);
+}
+
+test "parseFromSlice optional Value field, sequence of scalars" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  - 1
+        \\  - 2
+        \\  - 3
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables != null);
+    try testing.expect(parsed.value.variables.? == .array);
+    try testing.expectEqual(@as(usize, 3), parsed.value.variables.?.array.items.len);
+}
+
+test "parseFromSlice optional Value field, sequence of mappings" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  - name: Milk
+        \\  - name: Eggs
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables != null);
+    const arr = parsed.value.variables.?.array.items;
+    try testing.expectEqual(@as(usize, 2), arr.len);
+    try testing.expect(arr[0] == .object);
+    try testing.expectEqualStrings("Milk", arr[0].object.get(.{ .string = "name" }).?.string);
+}
+
+test "parseFromSlice optional Value field, deeply nested mapping" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  outer:
+        \\    inner:
+        \\      leaf: 1
+        \\
+    , .{});
+    defer parsed.deinit();
+    const outer = parsed.value.variables.?.object.get(.{ .string = "outer" }).?;
+    const inner = outer.object.get(.{ .string = "inner" }).?;
+    const leaf = inner.object.get(.{ .string = "leaf" }).?;
+    try testing.expectEqual(@as(i64, 1), leaf.integer);
+}
+
+test "parseFromSlice optional Value field, mapping with mixed scalar types" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\variables:
+        \\  s: hello
+        \\  i: 7
+        \\  f: 1.5
+        \\  b: true
+        \\  n: null
+        \\
+    , .{});
+    defer parsed.deinit();
+    const obj = parsed.value.variables.?.object;
+    try testing.expectEqualStrings("hello", obj.get(.{ .string = "s" }).?.string);
+    try testing.expectEqual(@as(i64, 7), obj.get(.{ .string = "i" }).?.integer);
+    try testing.expectEqual(@as(f64, 1.5), obj.get(.{ .string = "f" }).?.float);
+    try testing.expectEqual(true, obj.get(.{ .string = "b" }).?.bool);
+    try testing.expect(obj.get(.{ .string = "n" }).? == .null);
+}
+
+test "parseFromSlice optional Value field, missing defaults to null" {
+    const T = struct {
+        name: []const u8,
+        variables: ?Value = null,
+    };
+    var parsed = try parseFromSlice(T, testing.allocator, "name: foo\n", .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("foo", parsed.value.name);
+    try testing.expect(parsed.value.variables == null);
+}
+
+test "parseFromSlice optional Value field, explicit null" {
+    const T = struct { variables: ?Value = null };
+    var parsed = try parseFromSlice(T, testing.allocator, "variables: null\n", .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.variables == null);
+}
+
+test "parseFromSlice two Value fields in same struct" {
+    const T = struct {
+        a: ?Value = null,
+        b: ?Value = null,
+    };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\a:
+        \\  x: 1
+        \\b:
+        \\  y: 2
+        \\
+    , .{});
+    defer parsed.deinit();
+    const ax = parsed.value.a.?.object.get(.{ .string = "x" }).?;
+    const by = parsed.value.b.?.object.get(.{ .string = "y" }).?;
+    try testing.expectEqual(@as(i64, 1), ax.integer);
+    try testing.expectEqual(@as(i64, 2), by.integer);
+}
+
+test "parseFromSlice Value field nested inside another struct" {
+    const Inner = struct { variables: ?Value = null };
+    const Outer = struct { inner: Inner };
+    var parsed = try parseFromSlice(Outer, testing.allocator,
+        \\inner:
+        \\  variables:
+        \\    section: true
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.inner.variables != null);
+    const got = parsed.value.inner.variables.?.object.get(.{ .string = "section" }).?;
+    try testing.expectEqual(true, got.bool);
+}
+
+test "parseFromSlice Value field inside slice of structs" {
+    const Item = struct { variables: ?Value = null };
+    const T = struct { items: []const Item };
+    var parsed = try parseFromSlice(T, testing.allocator,
+        \\items:
+        \\  - variables:
+        \\      a: 1
+        \\  - variables:
+        \\      b: 2
+        \\
+    , .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.items.len);
+    const a = parsed.value.items[0].variables.?.object.get(.{ .string = "a" }).?;
+    const b = parsed.value.items[1].variables.?.object.get(.{ .string = "b" }).?;
+    try testing.expectEqual(@as(i64, 1), a.integer);
+    try testing.expectEqual(@as(i64, 2), b.integer);
+}
+
 test "type with all three hooks round-trips" {
     // A type whose YAML form is an array of two ints but whose Zig
     // representation is a struct of named fields. Exercises yamlParse,

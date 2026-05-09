@@ -568,16 +568,18 @@ fn decodeMappingValueAsMapping(
     options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
+    // Dispatch to a custom yamlParse hook when the target type provides one.
+    // Hoisted above the struct/optional cases so unions like Value (which
+    // define yamlParse but are neither structs nor optionals) are handled.
+    if (comptime hasYamlParse(T)) {
+        const node = Node{ .mapping_value = mv };
+        return T.yamlParse(allocator, node, options);
+    }
+
     const info = @typeInfo(T);
 
     // For structs, decode the single key-value pair.
-    if (info == .@"struct" and T != Value) {
-        if (comptime hasYamlParse(T)) {
-            // Wrap in mapping node for yamlParse.
-            const node = Node{ .mapping_value = mv };
-            return T.yamlParse(allocator, node, options);
-        }
-
+    if (info == .@"struct") {
         var result: T = undefined;
         const fields = std.meta.fields(T);
         inline for (fields) |field| {
@@ -4147,7 +4149,7 @@ test "duplicate map key with use_first option" {
         \\a: b
         \\a: c
         \\
-        ,
+    ,
         .{ .duplicate_field_behavior = .use_first },
     );
     defer r.deinit();
