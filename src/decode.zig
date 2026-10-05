@@ -340,23 +340,26 @@ pub fn decodeValueInternal(
             }
             break :blk result;
         },
-        .@"struct" => blk: {
+        .@"struct" => |struct_info| blk: {
             if (value != .object) break :blk error.TypeMismatch;
             const obj = value.object;
             var result: T = undefined;
-            inline for (info.@"struct".fields) |field| {
-                if (obj.get(.{ .string = field.name })) |fv| {
-                    @field(result, field.name) = try decodeValueInternal(
-                        field.type,
+            inline for (
+                struct_info.field_names,
+                struct_info.field_types,
+                struct_info.field_attrs,
+            ) |field_name, field_type, field_attrs| {
+                if (obj.get(.{ .string = field_name })) |fv| {
+                    @field(result, field_name) = try decodeValueInternal(
+                        field_type,
                         allocator,
                         fv,
                         options,
                     );
-                } else if (field.default_value_ptr) |dv| {
-                    @field(result, field.name) =
-                        @as(*const field.type, @ptrCast(@alignCast(dv))).*;
-                } else if (@typeInfo(field.type) == .optional) {
-                    @field(result, field.name) = null;
+                } else if (field_attrs.defaultValue(field_type)) |dv| {
+                    @field(result, field_name) = dv;
+                } else if (@typeInfo(field_type) == .optional) {
+                    @field(result, field_name) = null;
                 } else {
                     break :blk error.MissingField;
                 }
@@ -365,8 +368,8 @@ pub fn decodeValueInternal(
                 for (obj.keys()) |k| {
                     if (k != .string) continue;
                     var found = false;
-                    inline for (info.@"struct".fields) |field| {
-                        if (std.mem.eql(u8, k.string, field.name)) {
+                    inline for (struct_info.field_names) |field_name| {
+                        if (std.mem.eql(u8, k.string, field_name)) {
                             found = true;
                             break;
                         }
@@ -581,13 +584,17 @@ fn decodeMappingValueAsMapping(
     // For structs, decode the single key-value pair.
     if (info == .@"struct") {
         var result: T = undefined;
-        const fields = std.meta.fields(T);
-        inline for (fields) |field| {
-            if (field.defaultValue()) |dv| {
-                @field(result, field.name) = dv;
+        const struct_info = info.@"struct";
+        inline for (
+            struct_info.field_names,
+            struct_info.field_types,
+            struct_info.field_attrs,
+        ) |field_name, field_type, field_attrs| {
+            if (field_attrs.defaultValue(field_type)) |dv| {
+                @field(result, field_name) = dv;
             }
         }
-        var fields_set: [fields.len]bool = [_]bool{false} ** fields.len;
+        var fields_set: [struct_info.field_names.len]bool = @splat(false);
 
         if (mv.key) |key_node| {
             if (key_node.* == .merge_key or isMergeKeyTag(key_node.*)) {
@@ -604,22 +611,26 @@ fn decodeMappingValueAsMapping(
                 }
             } else {
                 const key_str = getKeyString(key_node.*, anchors);
-                inline for (fields, 0..) |field, idx| {
-                    if (std.mem.eql(u8, key_str, field.name)) {
+                inline for (
+                    struct_info.field_names,
+                    struct_info.field_types,
+                    0..,
+                ) |field_name, field_type, idx| {
+                    if (std.mem.eql(u8, key_str, field_name)) {
                         if (mv.value) |vn| {
-                            @field(result, field.name) =
+                            @field(result, field_name) =
                                 try decodeNodeInternal(
-                                    field.type,
+                                    field_type,
                                     allocator,
                                     vn.*,
                                     options,
                                     anchors,
                                 );
                         } else {
-                            if (@typeInfo(field.type) == .optional) {
-                                @field(result, field.name) = null;
-                            } else if (comptime isStringType(field.type)) {
-                                @field(result, field.name) = "";
+                            if (@typeInfo(field_type) == .optional) {
+                                @field(result, field_name) = null;
+                            } else if (comptime isStringType(field_type)) {
+                                @field(result, field_name) = "";
                             }
                         }
                         fields_set[idx] = true;
@@ -627,8 +638,8 @@ fn decodeMappingValueAsMapping(
                 }
                 if (!options.ignore_unknown_fields) {
                     var found = false;
-                    inline for (fields) |field| {
-                        if (std.mem.eql(u8, key_str, field.name)) {
+                    inline for (struct_info.field_names) |field_name| {
+                        if (std.mem.eql(u8, key_str, field_name)) {
                             found = true;
                         }
                     }
@@ -1110,15 +1121,19 @@ fn decodeToStruct(
     options: ParseOptions,
     anchors: *AnchorMap,
 ) !T {
+    const struct_info = @typeInfo(T).@"struct";
     if (node == .null_value) {
         // Null input: return struct with all defaults if possible.
         var result: T = undefined;
-        const fields = std.meta.fields(T);
-        inline for (fields) |field| {
-            if (field.defaultValue()) |dv| {
-                @field(result, field.name) = dv;
-            } else if (@typeInfo(field.type) == .optional) {
-                @field(result, field.name) = null;
+        inline for (
+            struct_info.field_names,
+            struct_info.field_types,
+            struct_info.field_attrs,
+        ) |field_name, field_type, field_attrs| {
+            if (field_attrs.defaultValue(field_type)) |dv| {
+                @field(result, field_name) = dv;
+            } else if (@typeInfo(field_type) == .optional) {
+                @field(result, field_name) = null;
             } else {
                 return error.TypeMismatch;
             }
@@ -1129,17 +1144,20 @@ fn decodeToStruct(
     const mapping = node.mapping;
 
     var result: T = undefined;
-    const fields = std.meta.fields(T);
 
     // Initialize with defaults.
-    inline for (fields) |field| {
-        if (field.defaultValue()) |dv| {
-            @field(result, field.name) = dv;
+    inline for (
+        struct_info.field_names,
+        struct_info.field_types,
+        struct_info.field_attrs,
+    ) |field_name, field_type, field_attrs| {
+        if (field_attrs.defaultValue(field_type)) |dv| {
+            @field(result, field_name) = dv;
         }
     }
 
     // Track which fields were set.
-    var fields_set: [fields.len]bool = [_]bool{false} ** fields.len;
+    var fields_set: [struct_info.field_names.len]bool = @splat(false);
 
     // Process mapping values.
     for (mapping.values) |mv| {
@@ -1157,12 +1175,17 @@ fn decodeToStruct(
         const key_str = getKeyString(key_node.*, anchors);
 
         var field_matched = false;
-        inline for (fields, 0..) |field, idx| {
-            if (std.mem.eql(u8, key_str, field.name)) {
+        inline for (
+            struct_info.field_names,
+            struct_info.field_types,
+            struct_info.field_attrs,
+            0..,
+        ) |field_name, field_type, field_attrs, idx| {
+            if (std.mem.eql(u8, key_str, field_name)) {
                 if (val_node) |vn| {
-                    @field(result, field.name) =
+                    @field(result, field_name) =
                         try decodeNodeInternal(
-                            field.type,
+                            field_type,
                             allocator,
                             vn.*,
                             options,
@@ -1170,11 +1193,11 @@ fn decodeToStruct(
                         );
                 } else {
                     // Null value.
-                    if (@typeInfo(field.type) == .optional) {
-                        @field(result, field.name) = null;
-                    } else if (comptime isStringType(field.type)) {
-                        @field(result, field.name) = "";
-                    } else if (field.default_value_ptr != null) {
+                    if (@typeInfo(field_type) == .optional) {
+                        @field(result, field_name) = null;
+                    } else if (comptime isStringType(field_type)) {
+                        @field(result, field_name) = "";
+                    } else if (field_attrs.default_value_ptr != null) {
                         // Keep default.
                     }
                 }
@@ -1192,8 +1215,8 @@ fn decodeToStruct(
 
         if (!options.ignore_unknown_fields) {
             var found = false;
-            inline for (fields) |field| {
-                if (std.mem.eql(u8, key_str, field.name)) {
+            inline for (struct_info.field_names) |field_name| {
+                if (std.mem.eql(u8, key_str, field_name)) {
                     found = true;
                 }
             }
@@ -1202,10 +1225,15 @@ fn decodeToStruct(
     }
 
     // Check required fields.
-    inline for (fields, 0..) |field, idx| {
-        if (!fields_set[idx] and field.default_value_ptr == null) {
-            if (@typeInfo(field.type) == .optional) {
-                @field(result, field.name) = null;
+    inline for (
+        struct_info.field_names,
+        struct_info.field_types,
+        struct_info.field_attrs,
+        0..,
+    ) |field_name, field_type, field_attrs, idx| {
+        if (!fields_set[idx] and field_attrs.default_value_ptr == null) {
+            if (@typeInfo(field_type) == .optional) {
+                @field(result, field_name) = null;
             } else {
                 // Field is required but not set - leave it uninitialized
                 // (this matches behavior where missing non-optional fields
@@ -1329,17 +1357,21 @@ fn applyMergeToStruct(
     // Handle mapping_value as a single-entry mapping.
     if (resolved == .mapping_value) {
         const single_mv = resolved.mapping_value;
-        const fields = std.meta.fields(T);
+        const struct_info = @typeInfo(T).@"struct";
         if (single_mv.key) |key_node| {
             const key_str = getKeyString(key_node.*, anchors);
             const mv_val = single_mv.value;
-            inline for (fields, 0..) |field, idx| {
-                if (std.mem.eql(u8, key_str, field.name)) {
+            inline for (
+                struct_info.field_names,
+                struct_info.field_types,
+                0..,
+            ) |field_name, field_type, idx| {
+                if (std.mem.eql(u8, key_str, field_name)) {
                     if (!fields_set[idx]) {
                         if (mv_val) |vn| {
-                            @field(result, field.name) =
+                            @field(result, field_name) =
                                 try decodeNodeInternal(
-                                    field.type,
+                                    field_type,
                                     allocator,
                                     vn.*,
                                     options,
@@ -1356,19 +1388,23 @@ fn applyMergeToStruct(
 
     if (resolved != .mapping) return;
 
-    const fields = std.meta.fields(T);
+    const struct_info = @typeInfo(T).@"struct";
     for (resolved.mapping.values) |mv| {
         const key_node = mv.key orelse continue;
         const key_str = getKeyString(key_node.*, anchors);
         const mv_val = mv.value;
 
-        inline for (fields, 0..) |field, idx| {
-            if (std.mem.eql(u8, key_str, field.name)) {
+        inline for (
+            struct_info.field_names,
+            struct_info.field_types,
+            0..,
+        ) |field_name, field_type, idx| {
+            if (std.mem.eql(u8, key_str, field_name)) {
                 if (!fields_set[idx]) {
                     if (mv_val) |vn| {
-                        @field(result, field.name) =
+                        @field(result, field_name) =
                             try decodeNodeInternal(
-                                field.type,
+                                field_type,
                                 allocator,
                                 vn.*,
                                 options,

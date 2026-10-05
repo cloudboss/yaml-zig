@@ -2,7 +2,7 @@ PROJECT = $(shell basename ${PWD})
 DIR_ROOT = $(realpath $(CURDIR))
 DIR_OUT = _output
 
-ZIG_VERSION = 0.16.0
+ZIG_VERSION = 0.17.0
 CTR_IMAGE_BASE = alpine:3.21
 
 UID = $(shell id -u)
@@ -17,7 +17,11 @@ DOCKER_INPUTS_SHA256 = $(shell echo -n $(UID_SHA256)$(GID_SHA256)$(CTR_IMAGE_BAS
 CTR_IMAGE_LOCAL = $(PROJECT):$(DOCKER_INPUTS_SHA256)
 HAS_IMAGE_LOCAL = $(DIR_OUT)/.image-local-$(DOCKER_INPUTS_SHA256)
 
-ZIG_BUILD_FLAGS = --cache-dir $(DIR_OUT)/zig-cache --global-cache-dir $(DIR_OUT)/zig-cache --prefix $(DIR_OUT)/zig-out
+ZIG_BUILD = ZIG_GLOBAL_CACHE_DIR=$(DIR_OUT)/zig-cache zig build
+ZIG_BUILD_FLAGS = \
+	--cache-dir $(DIR_OUT)/zig-cache \
+	--pkg-dir $(DIR_OUT)/zig-pkg \
+	--prefix $(DIR_OUT)/zig-out
 
 .DEFAULT_GOAL = build
 
@@ -43,21 +47,21 @@ build: $(HAS_IMAGE_LOCAL)
 		-v $(DIR_ROOT):/code \
 		-w /code \
 		--security-opt label=type:container_runtime_t \
-		$(CTR_IMAGE_LOCAL) /bin/sh -c "zig build $(ZIG_BUILD_FLAGS)"
+		$(CTR_IMAGE_LOCAL) /bin/sh -c "$(ZIG_BUILD) $(ZIG_BUILD_FLAGS)"
 
 test: $(HAS_IMAGE_LOCAL)
 	@docker run --rm \
 		-v $(DIR_ROOT):/code \
 		-w /code \
 		--security-opt label=type:container_runtime_t \
-		$(CTR_IMAGE_LOCAL) /bin/sh -c "zig build test $(ZIG_BUILD_FLAGS)"
+		$(CTR_IMAGE_LOCAL) /bin/sh -c "$(ZIG_BUILD) test $(ZIG_BUILD_FLAGS)"
 
 docs: $(HAS_IMAGE_LOCAL)
 	@docker run --rm \
 		-v $(DIR_ROOT):/code \
 		-w /code \
 		--security-opt label=type:container_runtime_t \
-		$(CTR_IMAGE_LOCAL) /bin/sh -c "zig build docs $(ZIG_BUILD_FLAGS)"
+		$(CTR_IMAGE_LOCAL) /bin/sh -c "$(ZIG_BUILD) docs $(ZIG_BUILD_FLAGS)"
 
 clean:
 	@rm -rf $(DIR_OUT)

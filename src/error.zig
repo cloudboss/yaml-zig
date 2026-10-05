@@ -21,7 +21,7 @@ pub const Diagnostics = struct {
     pub fn format(self: Diagnostics, allocator: std.mem.Allocator) ![]u8 {
         if (self.context_message.len > 0) {
             if (self.context_position) |cp| {
-                return std.fmt.allocPrint(allocator,
+                return allocator.print(
                     \\{s} at line {d}, column {d}
                     \\{s} at line {d}, column {d}
                 , .{
@@ -35,13 +35,12 @@ pub const Diagnostics = struct {
             }
         }
         if (self.position) |p| {
-            return std.fmt.allocPrint(
-                allocator,
+            return allocator.print(
                 "{s} at line {d}, column {d}",
                 .{ self.message, p.line, p.column },
             );
         }
-        return std.fmt.allocPrint(allocator, "{s}", .{self.message});
+        return allocator.print("{s}", .{self.message});
     }
 };
 

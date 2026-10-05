@@ -2,6 +2,8 @@
 
 A standards compliant YAML 1.2 parser and serializer for Zig. Follows an API similar to Zig's `std.json`.
 
+Requires Zig 0.17.0.
+
 Inspired by [goccy/go-yaml](https://github.com/goccy/go-yaml) and borrows heavily from the test suite. Passes the [official YAML test suite](https://github.com/yaml/yaml-test-suite).
 
 API docs are at [https://cloudboss.co/yaml-zig](https://cloudboss.co/yaml-zig/).
@@ -33,10 +35,11 @@ const B = struct {
 ## Deserialization
 
 ```zig
+const std = @import("std");
 const yaml = @import("yaml");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -51,7 +54,7 @@ pub fn main() !void {
 
     // `parsed` is of type `Parsed(A)`
     const parsed = try yaml.parseFromSlice(A, allocator, doc, .{});
-    defer parsed.deinit()
+    defer parsed.deinit();
 
     // access the `A` instance through `parsed.value`
     std.debug.print("{s}\n", .{parsed.value.x});
@@ -75,10 +78,11 @@ example
 ## Serialization
 
 ```zig
+const std = @import("std");
 const yaml = @import("yaml");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -88,7 +92,7 @@ pub fn main() !void {
         .b = .{ .a = 1, .b = 2, .c = 3 },
     };
 
-    const string = try yaml.stringifyAlloc(allocator, a, .{});
+    const string = try yaml.Stringify.valueAlloc(allocator, a, .{});
     defer allocator.free(string);
 
     std.debug.print("{s}", .{string});

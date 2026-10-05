@@ -589,29 +589,29 @@ fn writeSliceInner(
 }
 
 fn writeStruct(
-    comptime s: std.builtin.Type.Struct,
+    comptime s: std.lang.Type.Struct,
     comptime T: type,
     writer: *std.Io.Writer,
     val: T,
     depth: u32,
     options: Options,
 ) !void {
-    if (s.fields.len == 0) {
+    if (s.field_names.len == 0) {
         try writer.writeAll("{}");
         return;
     }
     var first = true;
-    inline for (s.fields) |field| {
-        const field_val = @field(val, field.name);
-        const skip = options.omit_empty and isEmptyValue(field.type, field_val);
+    inline for (s.field_names, s.field_types) |field_name, field_type| {
+        const field_val = @field(val, field_name);
+        const skip = options.omit_empty and isEmptyValue(field_type, field_val);
         if (!skip) {
             if (!first) {
                 try writer.writeByte('\n');
                 try writeIndent(writer, depth, options.indent);
             }
             first = false;
-            try writer.writeAll(field.name);
-            try writeFieldValue(field.type, writer, field_val, depth, options);
+            try writer.writeAll(field_name);
+            try writeFieldValue(field_type, writer, field_val, depth, options);
         }
     }
 }
@@ -638,7 +638,7 @@ fn writeFieldValue(
     const ti = @typeInfo(T);
     if (ti == .@"struct") {
         const s = ti.@"struct";
-        if (s.fields.len == 0) {
+        if (s.field_names.len == 0) {
             try writer.writeAll(": {}");
         } else {
             try writer.writeByte(':');
@@ -862,24 +862,24 @@ fn writeFlowSlice(
 }
 
 fn writeFlowStruct(
-    comptime s: std.builtin.Type.Struct,
+    comptime s: std.lang.Type.Struct,
     comptime T: type,
     writer: *std.Io.Writer,
     val: T,
     options: Options,
 ) !void {
-    if (s.fields.len == 0) {
+    if (s.field_names.len == 0) {
         try writer.writeAll("{}");
         return;
     }
     try writer.writeByte('{');
     var first = true;
-    inline for (s.fields) |field| {
+    inline for (s.field_names, s.field_types) |field_name, field_type| {
         if (!first) try writer.writeAll(", ");
         first = false;
-        try writer.writeAll(field.name);
+        try writer.writeAll(field_name);
         try writer.writeAll(": ");
-        try writeFlowValue(field.type, writer, @field(val, field.name), options);
+        try writeFlowValue(field_type, writer, @field(val, field_name), options);
     }
     try writer.writeByte('}');
 }

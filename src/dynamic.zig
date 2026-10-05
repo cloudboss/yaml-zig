@@ -126,7 +126,7 @@ pub const Value = union(enum) {
 };
 
 fn hashValue(h: *std.hash.Wyhash, v: Value) void {
-    const tag: u8 = @intFromEnum(@as(std.meta.Tag(Value), v));
+    const tag: u8 = @backingInt(v);
     h.update(std.mem.asBytes(&tag));
     switch (v) {
         .null => {},

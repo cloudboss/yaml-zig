@@ -274,6 +274,61 @@ test "parseFromValue into struct" {
     try testing.expectEqual(@as(u16, 3000), parsed.value.port);
 }
 
+test "parseFromValue nested struct defaults" {
+    const Nested = struct {
+        label: []const u8 = "default",
+        enabled: bool = true,
+    };
+    const Config = struct {
+        name: []const u8,
+        nested: Nested = .{},
+        count: u16 = 7,
+        mode: enum { local, remote } = .local,
+        note: ?[]const u8,
+        fallback: ?[]const u8 = "fallback",
+        empty: ?u8 = null,
+    };
+    const source = try parseFromSlice(Value, testing.allocator,
+        \\name: app
+        \\nested:
+        \\  enabled: false
+        \\mode: remote
+    , .{});
+    defer source.deinit();
+
+    const parsed = try parseFromValue(Config, testing.allocator, source.value, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("app", parsed.value.name);
+    try testing.expectEqualStrings("default", parsed.value.nested.label);
+    try testing.expect(!parsed.value.nested.enabled);
+    try testing.expectEqual(@as(u16, 7), parsed.value.count);
+    try testing.expectEqual(.remote, parsed.value.mode);
+    try testing.expectEqual(null, parsed.value.note);
+    try testing.expectEqualStrings("fallback", parsed.value.fallback.?);
+    try testing.expectEqual(null, parsed.value.empty);
+}
+
+test "parseFromValue validates struct fields" {
+    const Config = struct { port: u16 };
+    try testing.expectError(
+        error.MissingField,
+        parseFromValue(Config, testing.allocator, .{ .object = .empty }, .{}),
+    );
+
+    const source = try parseFromSlice(Value, testing.allocator, "port: 8080\nextra: true", .{});
+    defer source.deinit();
+    try testing.expectError(
+        error.UnknownField,
+        parseFromValue(Config, testing.allocator, source.value, .{}),
+    );
+
+    const parsed = try parseFromValue(Config, testing.allocator, source.value, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u16, 8080), parsed.value.port);
+}
+
 test "parseFromValueLeaky scalar" {
     const n = try parseFromValueLeaky(i64, testing.allocator, .{ .integer = 42 }, .{});
     try testing.expectEqual(@as(i64, 42), n);

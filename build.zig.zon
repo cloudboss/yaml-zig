@@ -2,11 +2,11 @@
     .name = .yaml,
     .version = "0.0.0",
     .fingerprint = 0xea31a98436b60a09,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zest = .{
-            .url = "git+https://github.com/cloudboss/zest#cd7532a068d1e8ca87df0dee9ea9c191d24bd41a",
-            .hash = "zest-0.1.0-2zk2nt1EAABzZoN2yRNsVSyQ-BQpMlsZu8hMvHMjPE2m",
+            .url = "git+https://github.com/cloudboss/zest#420846a238e832b42c05bd857773c5a96d8cd586",
+            .hash = "zest-0.1.0-2zk2no5cAAA5jmFf2VGXVTRUS5tAs8av0ztt_iLkMaAe",
             .lazy = true,
         },
     },
